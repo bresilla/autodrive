@@ -39,9 +39,11 @@ import routes
 # CONFIG
 # =============================================================================
 
-ROUTE = "uturn"             # "line" | "uturn"
+ROUTE = "uturn"             # "line" | "uturn"  (GeoJSON files, see routes.GEOJSON)
 
-DATUM_LAT, DATUM_LON = 51.0, 5.0
+# Datum is taken from the loaded route's first vertex at startup; these are just
+# placeholders so the module-level gate helpers below have something to bind.
+DATUM_LAT, DATUM_LON = 0.0, 0.0
 FIELD_MARGIN_M = 15.0       # field box is the route bounding box + this margin
 
 REQUIRE_GPS_PPP = True
@@ -50,7 +52,11 @@ REQUIRE_INSIDE_FIELD = True
 
 RESEND_WINDOW_EVERY_S = 1.0
 NEAREST_BACKTRACK = 3
-NEAREST_AHEAD = 200
+# Keep the nearest-point search local: a window much larger than the machine's
+# per-tick advance can snap onto a *parallel* leg of the route (the legs of a
+# U-turn are only a few metres apart), and the monotonic clamp below makes that
+# jump permanent. ~12 m of look-ahead covers any real advance between estimates.
+NEAREST_AHEAD = 25
 LOOP_TIMEOUT_S = 120.0      # bench safety stop; set None for an unbounded run
 
 
@@ -98,12 +104,15 @@ def estimate_index(status, route, previous):
 
 
 def stream_window(bus, status, waypoints, current_index):
+    """Stream the rolling window. Returns the exclusive end index reached, so the
+    caller can tell how much of the line is on the bus (for the run gate)."""
     start = max(0, current_index - a.WINDOW_OVERLAP_POINTS)
     end = min(len(waypoints), current_index + a.FUTURE_POINT_COUNT)
     for wp in waypoints[start:end]:
         a.drain_rx(bus, status, max_frames=5)
         a.send(bus, a.PGN_ADWPI, a.encode_adwpi(wp))
         time.sleep(a.SEND_INTERVAL_S)
+    return end
 
 
 # =============================================================================
@@ -111,7 +120,8 @@ def stream_window(bus, status, waypoints, current_index):
 # =============================================================================
 
 def main() -> None:
-    route = routes.ROUTES[ROUTE]()
+    global DATUM_LAT, DATUM_LON
+    route, DATUM_LAT, DATUM_LON = routes.ROUTES[ROUTE]()
     field = routes.bounding_field(route, FIELD_MARGIN_M)
 
     bus = a.make_bus()
@@ -147,9 +157,12 @@ def main() -> None:
         if waypoints:
             current_index = estimate_index(status, route, current_index)
             if active and (now - last_window) >= RESEND_WINDOW_EVERY_S:
-                stream_window(bus, status, waypoints, current_index)
+                reached = stream_window(bus, status, waypoints, current_index)
                 last_window = time.monotonic() - t0
-                run_command = True   # ≥100 points streamed → run gate satisfied
+                # Run gate (PROTOCOL.md §6): the first batch — ≥100 points, or the
+                # whole line if it is shorter — must be on the bus before RunCommand.
+                if not run_command and reached >= min(a.FUTURE_POINT_COUNT, len(waypoints)):
+                    run_command = True
 
         if (now - last_adjob) >= a.ADJOB_PERIOD_S:
             last_adjob = now

@@ -30,11 +30,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autosteer as a
 import routes
 
-DATUM_LAT, DATUM_LON = 51.0, 5.0
+# Datum is taken from the loaded route's first vertex in main(); placeholder here.
+DATUM_LAT, DATUM_LON = 0.0, 0.0
 RUN_SECONDS = 60.0
 RESEND_EVERY_S = 1.0
 NEAREST_BACKTRACK = 3
-NEAREST_AHEAD = 200
+# Keep the nearest-point search local: a window much larger than the machine's
+# per-tick advance can snap onto a *parallel* leg of the route (the legs of a
+# U-turn are only a few metres apart), and the monotonic clamp below makes that
+# jump permanent. ~12 m of look-ahead covers any real advance between estimates.
+NEAREST_AHEAD = 25
 
 
 def build_waypoints(route, anchor_lat, anchor_lon):
@@ -60,21 +65,24 @@ def estimate_index(status, route, previous):
 
 
 def stream_window(bus, status, waypoints, current_index):
+    """Stream the rolling window. Returns the exclusive end index reached, so the
+    caller can tell how much of the line is on the bus (for the run gate)."""
     start = max(0, current_index - a.WINDOW_OVERLAP_POINTS)
     end = min(len(waypoints), current_index + a.FUTURE_POINT_COUNT)
     for wp in waypoints[start:end]:
         a.drain_rx(bus, status, max_frames=5)
         a.send(bus, a.PGN_ADWPI, a.encode_adwpi(wp))
         time.sleep(a.SEND_INTERVAL_S)
+    return end
 
 
 def main() -> None:
-    route = routes.straight_line(length_m=40.0)
+    global DATUM_LAT, DATUM_LON
+    route, DATUM_LAT, DATUM_LON = routes.geojson_route(routes.geojson_path("line"))
     bus = a.make_bus()
     status = a.MachineStatus()
 
     run_command = False
-    streamed_once = False
     current_index = 0
     waypoints: list[a.Waypoint] = []
     t0 = time.monotonic()
@@ -98,12 +106,13 @@ def main() -> None:
         if waypoints:
             current_index = estimate_index(status, route, current_index)
             if active and (now - last_window) >= RESEND_EVERY_S:
-                stream_window(bus, status, waypoints, current_index)
+                reached = stream_window(bus, status, waypoints, current_index)
                 last_window = now
-                if not streamed_once:
-                    streamed_once = True
-                    print(f"[{now:5.1f}s] first window streamed → RunCommand allowed")
-                run_command = True
+                # Run gate (PROTOCOL.md §6): the first batch — ≥100 points, or the
+                # whole line if it is shorter — must be on the bus before RunCommand.
+                if not run_command and reached >= min(a.FUTURE_POINT_COUNT, len(waypoints)):
+                    run_command = True
+                    print(f"[{now:5.1f}s] first batch streamed ({reached} pts) → RunCommand allowed")
 
         if (now - last_adjob) >= a.ADJOB_PERIOD_S:
             last_adjob = now

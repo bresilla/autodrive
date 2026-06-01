@@ -28,12 +28,14 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import autosteer as a
+import routes
 
 RUN_SECONDS = 12.0
 
-DATUM_LAT, DATUM_LON = 51.0, 5.0
-# A 200 m square centred near the datum, in ENU metres. On the real machine set
-# this to the actual field (and the datum near it).
+# Datum = the "line" route's first vertex (its start), matching the simulator and
+# the later steps. On the real machine, point this at your actual field.
+DATUM_LAT, DATUM_LON = routes.geojson_datum(routes.geojson_path("line"))
+# A 200 m square centred on the datum (= route start), in ENU metres.
 FIELD_ENU = [(-100.0, -100.0), (100.0, -100.0), (100.0, 100.0), (-100.0, 100.0)]
 HAVE_WAYPOINTS = True   # pretend a route is loaded (step 08+ make it real)
 

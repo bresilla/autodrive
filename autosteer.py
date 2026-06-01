@@ -29,7 +29,6 @@ import time
 # One switch for every script: the SocketCAN interface to use.
 #   - bench test:   export CAN_BUS=vcan0   (with ./simulator.py running as Display)
 #   - real machine: export CAN_BUS=can0
-#   - dry inspect:  export CAN_BUS=fake    (print TX frames, never receive)
 CAN_BUS = os.environ.get("CAN_BUS", "vcan0")
 
 J1939_PRIORITY = 6
@@ -235,9 +234,24 @@ def encode_adjob(system_active: bool, run_command: bool, current_index: int,
     return bytes(b)
 
 
+ADWPI_COORD_MIN_CM = ADWPI_COORD_OFFSET_CM                       # -250000 cm
+ADWPI_COORD_MAX_CM = ADWPI_COORD_RAW_MAX + ADWPI_COORD_OFFSET_CM  # +798575 cm
+
+
+class CoordinateRangeError(ValueError):
+    """A waypoint offset falls outside the 20-bit ADWPI range (PROTOCOL.md §5.2)."""
+
+
 def cm_to_adwpi_raw(cm: int) -> int:
+    """cm east/north of the anchor → 20-bit raw. Raises if out of range rather than
+    silently saturating — an over-range point means the anchor is too far from the
+    field, and quietly folding it onto the boundary would draw a wrong line."""
     raw = cm - ADWPI_COORD_OFFSET_CM
-    return max(0, min(ADWPI_COORD_RAW_MAX, raw))
+    if not 0 <= raw <= ADWPI_COORD_RAW_MAX:
+        raise CoordinateRangeError(
+            f"{cm} cm is outside the ADWPI range "
+            f"[{ADWPI_COORD_MIN_CM}, {ADWPI_COORD_MAX_CM}] cm")
+    return raw
 
 
 def adwpi_raw_to_cm(raw: int) -> int:
@@ -282,8 +296,10 @@ def decode_adwpi(data: bytes) -> Waypoint:
         index=index,
         east_cm=adwpi_raw_to_cm(east_raw),
         north_cm=adwpi_raw_to_cm(north_raw),
-        is_headland=(flags & ADWPI_FLAG_HEADLAND) == ADWPI_FLAG_HEADLAND,
-        is_reverse=(flags & ADWPI_FLAG_REVERSE) == ADWPI_FLAG_REVERSE,
+        # 2-bit J1939 fields: isolate the whole pair, "on" only when it equals 01.
+        # 10 (error) / 11 (not available) must read false (see PROTOCOL.md §5.1).
+        is_headland=(flags & (ADWPI_FLAG_HEADLAND * 3)) == ADWPI_FLAG_HEADLAND,
+        is_reverse=(flags & (ADWPI_FLAG_REVERSE * 3)) == ADWPI_FLAG_REVERSE,
     )
 
 
@@ -333,18 +349,6 @@ def format_frame(direction: str, frame: CanFrame) -> str:
     return f"{direction} 0x{frame.arbitration_id:08X} pgn=0x{pgn:04X} [{len(frame.data)}] {data}"
 
 
-class FakeBus:
-    """Prints TX frames, never receives. For dry runs without hardware."""
-
-    def send(self, frame: CanFrame) -> None:
-        print(format_frame("TX", frame))
-
-    def recv(self, timeout: float = 0.0) -> CanFrame | None:
-        if timeout:
-            time.sleep(timeout)
-        return None
-
-
 class SocketCanBus:
     """Thin wrapper over python-can for a real SocketCAN interface."""
 
@@ -373,9 +377,7 @@ class SocketCanBus:
 
 
 def make_bus(channel: str = CAN_BUS):
-    """Open the bus named by CAN_BUS. The special name "fake" prints TX only."""
-    if channel == "fake":
-        return FakeBus()
+    """Open the SocketCAN interface named by CAN_BUS (vcan0 for bench, can0 for the machine)."""
     return SocketCanBus(channel)
 
 

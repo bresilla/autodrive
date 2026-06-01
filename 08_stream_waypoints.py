@@ -27,7 +27,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autosteer as a
 import routes
 
-DATUM_LAT, DATUM_LON = 51.0, 5.0
+# Datum is taken from the loaded route's first vertex in main(); placeholder here.
+DATUM_LAT, DATUM_LON = 0.0, 0.0
 
 
 def build_waypoints(route, anchor_lat, anchor_lon):
@@ -54,7 +55,8 @@ def stream_window(bus, status, waypoints, current_index):
 
 
 def main() -> None:
-    route = routes.straight_line()
+    global DATUM_LAT, DATUM_LON
+    route, DATUM_LAT, DATUM_LON = routes.geojson_route(routes.geojson_path("line"))
     bus = a.make_bus()
     status = a.MachineStatus()
 

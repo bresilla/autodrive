@@ -6,10 +6,13 @@ A self-contained implementation of the GP (Oxbo) AutoDrive CAN protocol, plus a
 the current one passes.* If a step fails, fix the cause (each step lists the
 usual ones) and re-run that same step.
 
-This folder has no external dependencies beyond `python-can` — the route is a
-built-in test path (a straight line or a U-turn), not a field planner. The byte
-reference for everything is **[PROTOCOL.md](PROTOCOL.md)**; the protocol code is
-in **[`autosteer.py`](autosteer.py)**.
+This folder has no external dependencies beyond `python-can`. The route comes
+from a **GeoJSON `LineString`** — [`line.geojson`](line.geojson) (a straight
+path) and [`u_field.geojson`](u_field.geojson) (a U-shaped path with a turn) ship
+as the two test routes; [`routes.py`](routes.py) resamples them to ~0.5 m and
+flags the headland turn. Drop in your own GeoJSON line to drive a real field. The
+byte reference for everything is **[PROTOCOL.md](PROTOCOL.md)**; the protocol code
+is in **[`autosteer.py`](autosteer.py)**.
 
 > ⚠️ **SAFETY.** Steps 1–8 are passive or only transmit data — the machine does
 > not move. **Steps 9–10 make the machine drive and steer.** From step 9 on:
@@ -25,7 +28,6 @@ variable. That is the only thing that changes between bench and machine:
 ```sh
 export CAN_BUS=vcan0     # bench test (virtual bus + the simulator)
 export CAN_BUS=can0      # the real machine
-export CAN_BUS=fake      # print TX frames only, never receive (offline inspection)
 ```
 
 Default if unset: `vcan0`.
@@ -49,12 +51,14 @@ real one, and the included simulator plays the Display.
 
    ```sh
    export CAN_BUS=vcan0
-   ./simulator.py                 # or: ./simulator.py vcan0
+   ./simulator.py                 # plays the "line" route (= ./simulator.py vcan0 line)
+   ./simulator.py vcan0 uturn     # for step 10's U-turn route
    ```
 
-   It emits VP1/VDS/DSSTAT, acquires GPS PPP after a few seconds, computes an
-   anchor when you activate, and drives a virtual machine along the waypoints you
-   stream.
+   It starts the virtual machine **at the route's start point** (so the loop
+   closes), emits VP1/VDS/DSSTAT, acquires GPS PPP after a few seconds, computes
+   an anchor when you activate, and drives the machine along the waypoints you
+   stream. Pass the same route name the step is driving.
 
 3. **Run the steps** in another terminal (`export CAN_BUS=vcan0` there too).
 
@@ -78,9 +82,10 @@ bus.
 
 2. `candump can0` in a second terminal to watch traffic independently.
 
-3. Edit the field box / datum in [`06_activate_and_anchor.py`](06_activate_and_anchor.py)
-   and [`10_full_run.py`](10_full_run.py) to your **actual field**; the
-   inside-field gate uses them.
+3. Replace [`line.geojson`](line.geojson) / [`u_field.geojson`](u_field.geojson)
+   with your **actual field** path (a GeoJSON `LineString` in WGS84 lon/lat). The
+   datum and the inside-field box are derived from the route, so nothing else
+   needs editing for the field location.
 
 4. Confirm the AutoDrive **source address** (proposal says `29 ?`) in
    [`autosteer.py`](autosteer.py) (`SOURCE_AUTODRIVE`).
@@ -194,8 +199,8 @@ and waits for the Display to broadcast a **DSAP anchor**.
 
 ### Step 7 — Are our waypoint coordinates correct? (offline)
 
-`07_coordinates.py` needs **no bus**. It converts a sample route to
-anchor-relative cm, packs ADWPI, and decodes it back.
+`07_coordinates.py` needs **no bus**. It loads the real `u_field.geojson` route,
+converts it to anchor-relative cm, packs every point to ADWPI, and decodes it back.
 
 ```sh
 ./07_coordinates.py
@@ -257,9 +262,10 @@ AutoSteer engages, progress tracked from GPS, window re-streamed as it advances.
 ROUTE = "uturn"     # "line" | "uturn"
 ```
 
-`uturn` is two legs joined by a 180° **headland turn** — it exercises the headland
-flag (`[H]` in the progress line) and a real curve, which is the realistic
-"next swath" case.
+`uturn` is the `u_field.geojson` path — two legs joined by a **headland turn** —
+which exercises the headland flag (`[H]` in the progress line) and a real curve,
+the realistic "next swath" case. On the bench, start the simulator on the same
+route: `./simulator.py vcan0 uturn`.
 
 ```sh
 ./10_full_run.py
@@ -295,10 +301,11 @@ flag (`[H]` in the progress line) and a real curve, which is the realistic
 | File | Role |
 |------|------|
 | [`PROTOCOL.md`](PROTOCOL.md) | Protocol reference — every PGN, byte, bit, the sequence. |
-| [`GP_AutoDrive_CanMessageProposal_V10.pdf`](GP_AutoDrive_CanMessageProposal_V10.pdf) | The authoritative vendor proposal (byte tables). |
+| [`spec/GP_AutoDrive_CanMessageProposal_V10.pdf`](spec/GP_AutoDrive_CanMessageProposal_V10.pdf) | The authoritative vendor proposal (byte tables). A plain-text extract sits beside it at [`spec/GP_AutoDrive_CanMessageProposal_V10.txt`](spec/GP_AutoDrive_CanMessageProposal_V10.txt). |
 | [`autosteer.py`](autosteer.py) | Shared library: encoders/decoders, J1939, CAN transport. `SOURCE_AUTODRIVE` lives here. |
-| [`routes.py`](routes.py) | Built-in test routes: `straight_line()`, `u_turn()`. No planner. |
-| [`simulator.py`](simulator.py) | Fake Display — run it on `vcan0` for bench testing. |
+| [`routes.py`](routes.py) | Loads GeoJSON routes (`geojson_route`): resample + headland flagging. Synthetic `straight_line()`/`u_turn()` remain as fallbacks. |
+| [`line.geojson`](line.geojson), [`u_field.geojson`](u_field.geojson) | The two test routes (WGS84 `LineString`s). Swap in your own field path here. |
+| [`simulator.py`](simulator.py) | Fake Display — `./simulator.py [channel] [route]` on `vcan0` for bench testing. |
 | `01`…`10_*.py` | The bring-up steps above. |
 
 ## Open vendor questions (resolve before relying on this in the field)

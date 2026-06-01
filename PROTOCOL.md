@@ -5,7 +5,7 @@ A from-scratch guide to the GP (Oxbo / GPH) AutoDrive CAN protocol, building fro
 bring-up scripts here (`01_*.py` … `10_full_run.py`) and the shared library
 [`autosteer.py`](autosteer.py).
 
-Source of truth: [`GP_AutoDrive_CanMessageProposal_V10.pdf`](GP_AutoDrive_CanMessageProposal_V10.pdf).
+Source of truth: [`spec/GP_AutoDrive_CanMessageProposal_V10.pdf`](spec/GP_AutoDrive_CanMessageProposal_V10.pdf).
 This document is the prose explanation; the PDF is the authoritative byte tables.
 
 > Status note: a few fields in the proposal are marked uncertain (`29 ?` source
@@ -343,8 +343,9 @@ Byte 8 flags (2-bit J1939 fields, "on" = `01`):
 | rest | Reserved          | —    | future: speed limit, extra steer instructions |
 
 Encoder: `encode_adwpi`. The flag constants live near the top of the script
-(`ADWPI_FLAG_HEADLAND = 0x01`, `ADWPI_FLAG_REVERSE = 0x04`) and are deliberately
-editable because their exact bit positions were among the questioned items.
+(`ADWPI_FLAG_REVERSE = 0x01` at bits 2-1, `ADWPI_FLAG_HEADLAND = 0x04` at bits 4-3,
+matching the table above) and are deliberately editable because their exact bit
+positions were among the questioned items.
 
 > Index semantics: `index[0]` is the very first point of the entire line. If the line
 > has 6000 points, `index[5999]` is the last. Indices are stable for the whole job.
@@ -525,11 +526,14 @@ CAN bus 2
 - `is_headland=True` → ADWPI headland flag → header lifts, speed drops, sharp turn.
 - `is_reverse=True` → ADWPI reverse flag → machine backs up to reach the point.
 
-This folder ships two built-in routes in [`routes.py`](routes.py) — `straight_line()`
-and `u_turn()` — which is all you need to prove the bridge end to end. To drive a real
-field plan instead, generate the `RoutePoint` list from your planner (keep points
-within the §6.1.2 spacing/angle limits) and hand it to the same loop; nothing else
-changes.
+This folder ships two routes as **GeoJSON `LineString`s** — `line.geojson` and
+`u_field.geojson` — loaded by [`routes.py`](routes.py)'s `geojson_route()`, which
+takes the first vertex as the ENU datum, resamples to `WAYPOINT_SPACING_M` (0.5 m,
+inside the §6.1.2 band), and flags the headland turn from the path's curvature. To
+drive a real field plan, drop in your own GeoJSON line (or build the `RoutePoint`
+list from any planner, keeping points within the §6.1.2 spacing/angle limits) and
+hand it to the same loop; nothing else changes. The synthetic `straight_line()` /
+`u_turn()` generators remain as no-file fallbacks.
 
 ---
 
@@ -585,4 +589,4 @@ the step-by-step runbook):
 ---
 
 *Implementation: the numbered scripts + [`autosteer.py`](autosteer.py).
-Authoritative byte tables: [`GP_AutoDrive_CanMessageProposal_V10.pdf`](GP_AutoDrive_CanMessageProposal_V10.pdf).*
+Authoritative byte tables: [`spec/GP_AutoDrive_CanMessageProposal_V10.pdf`](spec/GP_AutoDrive_CanMessageProposal_V10.pdf).*

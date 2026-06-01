@@ -8,8 +8,7 @@ building a J1939 id.
 What this step proves:
   * a CAN frame = arbitration id + up to 8 data bytes
   * how the 29-bit J1939 id splits into priority / PGN / source address
-  * how to pick a backend: "sim" (fake Display), "fake" (print only),
-    or "socketcan" (real iface)
+  * opening the SocketCAN interface named by CAN_BUS (vcan0 bench / can0 machine)
 
 Run:
     ./01_basic_can.py

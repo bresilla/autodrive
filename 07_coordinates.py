@@ -26,56 +26,62 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import autosteer as a
+import routes
 
-DATUM_LAT, DATUM_LON = 51.0, 5.0
-
-# A tiny route in planner ENU metres: (x=east, y=north, headland?, reverse?)
-ROUTE_ENU = [
-    (0.0, 0.0, False, False),
-    (0.0, 25.0, False, False),
-    (0.0, 50.0, True, False),    # headland point: lift header
-    (3.0, 50.0, True, True),     # headland + reverse
-    (3.0, 25.0, False, False),
-    (3.0, 0.0, False, False),
-]
-
-# Suppose the Display anchored at this lat/lon (a bit north-east of datum).
-ANCHOR_LAT, ANCHOR_LON = 51.0002, 5.0003
+# The real U-turn field path (u_field.geojson). Its datum is the route start.
+ROUTE_NAME = "uturn"
 
 
 def main() -> None:
-    anchor_e, anchor_n = a.wgs_to_enu_approx(ANCHOR_LAT, ANCHOR_LON, DATUM_LAT, DATUM_LON)
-    print(f"anchor in datum-ENU metres: east={anchor_e:.2f} north={anchor_n:.2f}\n")
+    route, datum_lat, datum_lon = routes.geojson_route(routes.geojson_path(ROUTE_NAME))
 
-    print(f"{'idx':>3} {'east_cm':>9} {'north_cm':>9}  flags        bytes")
-    for i, (x, y, hl, rev) in enumerate(ROUTE_ENU):
-        wp = a.Waypoint(
-            index=i,
-            east_cm=round((x - anchor_e) * 100.0),
-            north_cm=round((y - anchor_n) * 100.0),
-            is_headland=hl,
-            is_reverse=rev,
-        )
-        frame = a.encode_adwpi(wp)
-        back = a.decode_adwpi(frame)
+    # Suppose the Display anchored at the route start (the usual case: anchor =
+    # machine position when the job begins, and we begin at the first point).
+    anchor_lat, anchor_lon = datum_lat, datum_lon
+    anchor_e, anchor_n = a.wgs_to_enu_approx(anchor_lat, anchor_lon, datum_lat, datum_lon)
+    print(f"route {ROUTE_NAME!r}: {len(route)} points, "
+          f"datum/anchor {datum_lat:.7f},{datum_lon:.7f}\n")
 
-        # Prove the round-trip (cm survives exactly; flags survive exactly).
+    waypoints = [
+        a.Waypoint(index=i,
+                   east_cm=round((p.x - anchor_e) * 100.0),
+                   north_cm=round((p.y - anchor_n) * 100.0),
+                   is_headland=p.is_headland, is_reverse=p.is_reverse)
+        for i, p in enumerate(route)
+    ]
+
+    # Round-trip every waypoint, and confirm each packs within the ADWPI range
+    # (encode_adwpi raises CoordinateRangeError if a point is out of range).
+    east_max = north_max = 0
+    for wp in waypoints:
+        back = a.decode_adwpi(a.encode_adwpi(wp))
         assert back.index == wp.index
         assert back.east_cm == wp.east_cm
         assert back.north_cm == wp.north_cm
         assert back.is_headland == wp.is_headland
         assert back.is_reverse == wp.is_reverse
+        east_max = max(east_max, abs(wp.east_cm))
+        north_max = max(north_max, abs(wp.north_cm))
 
-        flags = []
-        if wp.is_headland:
-            flags.append("HEADLAND")
-        if wp.is_reverse:
-            flags.append("REVERSE")
-        flag_str = ",".join(flags) or "-"
-        hexbytes = " ".join(f"{b:02X}" for b in frame)
-        print(f"{i:>3} {wp.east_cm:>9} {wp.north_cm:>9}  {flag_str:12} {hexbytes}")
+    # Show a sample: the first few points and the headland turn transition.
+    first_hl = next((i for i, p in enumerate(route) if p.is_headland), None)
+    sample = list(range(3))
+    if first_hl is not None:
+        sample += [first_hl - 1, first_hl, first_hl + 1]
+    sample.append(len(waypoints) - 1)
 
-    print("\nall waypoints round-tripped encode→decode exactly. ✓")
+    print(f"{'idx':>4} {'east_cm':>9} {'north_cm':>9}  flags        bytes")
+    for i in sorted(set(j for j in sample if 0 <= j < len(waypoints))):
+        wp = waypoints[i]
+        flags = ",".join(f for f, on in
+                         (("HEADLAND", wp.is_headland), ("REVERSE", wp.is_reverse)) if on) or "-"
+        hexbytes = " ".join(f"{b:02X}" for b in a.encode_adwpi(wp))
+        print(f"{i:>4} {wp.east_cm:>9} {wp.north_cm:>9}  {flags:12} {hexbytes}")
+
+    print(f"\nmax offset from anchor: east {east_max} cm, north {north_max} cm "
+          f"(range {a.ADWPI_COORD_MIN_CM}..{a.ADWPI_COORD_MAX_CM}).")
+    print(f"all {len(waypoints)} waypoints round-tripped encode→decode exactly, "
+          f"all in range. ✓")
 
 
 if __name__ == "__main__":

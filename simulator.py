@@ -11,8 +11,9 @@ a real SocketCAN interface — use a virtual one (vcan0) for the bench:
     sudo ip link add dev vcan0 type vcan
     sudo ip link set up vcan0
 
-    # terminal A — the fake Display:
-    ./simulator.py                 # binds vcan0 (or pass a channel: ./simulator.py vcan0)
+    # terminal A — the fake Display (channel, then optional route name):
+    ./simulator.py                 # binds vcan0, plays the "line" route
+    ./simulator.py vcan0 uturn     # for bench-testing step 10's U-turn route
 
     # terminal B — the bring-up steps (CAN_BUS defaults to vcan0):
     ./03_get_location.py
@@ -38,11 +39,14 @@ import sys
 import time
 
 import autosteer as a
+import routes
 
 
 # -- tweakables ---------------------------------------------------------------
-DATUM_LAT, DATUM_LON = 51.0, 5.0
-START_LAT, START_LON = 51.0, 5.0      # where the virtual machine sits at boot
+# Datum + boot position are set from the route in main() so the virtual machine
+# starts on the route the client is driving; these are placeholders.
+DATUM_LAT, DATUM_LON = 0.0, 0.0
+START_LAT, START_LON = 0.0, 0.0       # where the virtual machine sits at boot
 PPP_ACQUIRE_S = 3.0
 ENGAGE_DELAY_S = 2.0
 MACHINE_SPEED_MPS = 1.5
@@ -199,9 +203,17 @@ class DisplayModel:
 
 def main() -> None:
     channel = sys.argv[1] if len(sys.argv) > 1 else a.CAN_BUS
+    route_name = sys.argv[2] if len(sys.argv) > 2 else "line"
+
+    # Sit the virtual machine at the route's start so the bench loop closes.
+    global DATUM_LAT, DATUM_LON, START_LAT, START_LON
+    DATUM_LAT, DATUM_LON = routes.geojson_datum(routes.geojson_path(route_name))
+    START_LAT, START_LON = DATUM_LAT, DATUM_LON
+
     bus = a.SocketCanBus(channel)
     model = DisplayModel()
-    print(f"simulator: fake Display on {channel} (Ctrl-C to stop)", file=sys.stderr)
+    print(f"simulator: fake Display on {channel}, route {route_name!r} "
+          f"@ {START_LAT:.7f},{START_LON:.7f} (Ctrl-C to stop)", file=sys.stderr)
 
     t0 = time.monotonic()
     last = t0
