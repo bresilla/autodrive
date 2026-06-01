@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""
+Step 09 — run command, progress tracking, and re-streaming.
+
+Goal: the full control loop on a built-in test line. Activate, stream the first
+window, raise RunCommand, watch the machine move, track progress from its GPS,
+and re-stream the window as it advances.
+
+What this step proves:
+  * the run gate: RunCommand may turn on only after ≥100 points streamed
+  * estimating the current waypoint index from GPS (monotonic nearest-point)
+  * re-sending the rolling window so points ahead are always known
+  * reporting progress in ADJOB's current-index field
+
+⚠️ On a real machine THIS MOVES THE MACHINE. Area clear, e-stop in hand.
+
+Run:
+    ./09_run_and_track.py
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import autosteer as a
+import routes
+
+DATUM_LAT, DATUM_LON = 51.0, 5.0
+RUN_SECONDS = 60.0
+RESEND_EVERY_S = 1.0
+NEAREST_BACKTRACK = 3
+NEAREST_AHEAD = 200
+
+
+def build_waypoints(route, anchor_lat, anchor_lon):
+    ae, an = a.wgs_to_enu_approx(anchor_lat, anchor_lon, DATUM_LAT, DATUM_LON)
+    return [a.Waypoint(index=i, east_cm=round((p.x - ae) * 100.0),
+                       north_cm=round((p.y - an) * 100.0),
+                       is_headland=p.is_headland, is_reverse=p.is_reverse)
+            for i, p in enumerate(route)]
+
+
+def estimate_index(status, route, previous):
+    if status.gps_lat is None:
+        return previous
+    x, y = a.wgs_to_enu_approx(status.gps_lat, status.gps_lon, DATUM_LAT, DATUM_LON)
+    start = max(0, previous - NEAREST_BACKTRACK)
+    end = min(len(route), previous + NEAREST_AHEAD)
+    best, best_d = previous, float("inf")
+    for i in range(start, end):
+        d = math.hypot(route[i].x - x, route[i].y - y)
+        if d < best_d:
+            best, best_d = i, d
+    return max(previous, best)
+
+
+def stream_window(bus, status, waypoints, current_index):
+    start = max(0, current_index - a.WINDOW_OVERLAP_POINTS)
+    end = min(len(waypoints), current_index + a.FUTURE_POINT_COUNT)
+    for wp in waypoints[start:end]:
+        a.drain_rx(bus, status, max_frames=5)
+        a.send(bus, a.PGN_ADWPI, a.encode_adwpi(wp))
+        time.sleep(a.SEND_INTERVAL_S)
+
+
+def main() -> None:
+    route = routes.straight_line(length_m=40.0)
+    bus = a.make_bus()
+    status = a.MachineStatus()
+
+    run_command = False
+    streamed_once = False
+    current_index = 0
+    waypoints: list[a.Waypoint] = []
+    t0 = time.monotonic()
+    last_adjob = -999.0
+    last_window = -999.0
+
+    while True:
+        now = time.monotonic() - t0
+        if now >= RUN_SECONDS:
+            break
+        frame = bus.recv(timeout=0.02)
+        if frame is not None:
+            a.process_frame(frame, status)
+
+        active = status.gps_ppp_available and status.autodrive_allowed
+
+        if active and status.anchor_lat is not None and not waypoints:
+            waypoints = build_waypoints(route, status.anchor_lat, status.anchor_lon)
+            print(f"[{now:5.1f}s] anchored; {len(waypoints)} waypoints prepared")
+
+        if waypoints:
+            current_index = estimate_index(status, route, current_index)
+            if active and (now - last_window) >= RESEND_EVERY_S:
+                stream_window(bus, status, waypoints, current_index)
+                last_window = now
+                if not streamed_once:
+                    streamed_once = True
+                    print(f"[{now:5.1f}s] first window streamed → RunCommand allowed")
+                run_command = True
+
+        if (now - last_adjob) >= a.ADJOB_PERIOD_S:
+            last_adjob = now
+            a.send(bus, a.PGN_ADJOB, a.encode_adjob(
+                system_active=active,
+                run_command=active and run_command,
+                current_index=current_index,
+                total_points=len(waypoints) if waypoints else len(route)))
+            if waypoints:
+                print(f"[{now:5.1f}s] progress {current_index:3}/{len(waypoints)}  "
+                      f"engaged={'Y' if status.autosteer_engaged else '-'}  "
+                      f"spd={status.speed_kph:4.1f}kph")
+
+        if waypoints and current_index >= len(waypoints) - 1:
+            print(f"\n[{now:5.1f}s] reached the last waypoint — done.")
+            break
+
+
+if __name__ == "__main__":
+    main()

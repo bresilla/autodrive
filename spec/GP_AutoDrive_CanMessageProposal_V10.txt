@@ -1,0 +1,251 @@
+1. AutoSteer system overview
+GPH currently has the following system (optionally) installed. The “Autonomous Driving Computer” would be fifth component, which basically takes
+over the Line Management partially from the Display.
+•
+
+•
+
+•
+
+•
+
+TOPCON AGS-2 Receiver:
+o Measures GPS & corrects with PPP (Sattelite) to ~4..10 cm
+precision)
+o Coordinate = the receiver itself, no offset applied yet
+AgJunction ECU-S1:
+o Reads GPS coordinates from Receiver via RS232 NMEA
+message
+o Transforms GPS coordinates to machine pivot point & header,
+applying tilt-correction from an IMU sensor as well
+o Receives line coordinates from the Display to follow (via
+Ethernet)
+o Receives (dis)Engage command & steeraxle sensor feedback
+from IQAN (via CAN)
+o Instructs the IQAN how to put the wheels; i.e. the steering
+command
+OXBO Cab Display:
+o Does the Line Management (create AB line & its parallels,
+import line from external source, …)
+o Draws a map & keeps track of where the machine has been
+o Shows some alerts & indicators (signal ok, steering interrupted
+because XYZ)
+o Can tweak a few (steering aggression) parameters on the
+AgJunction
+OXBO MC42-Propel:
+o Actuates the steering valve (set to X degrees according to
+desired curvature from SteerController)
+o Delivers feedback (actual angle) to SteerController
+o Sends (dis)Engage commands to SteerController
+
+2. Message Overview & Sequence
+
+Event
+Machine in field, not started
+Wait for GPS PPP signal…
+
+AutoDrive System message
+ADJOB (systemActive false)
+
+Display message
+
+Line info received, activate
+system
+Compute anchor point
+Stream (1st batch) waypoints
+Command forward
+Report status
+
+ADJOB (systemActive true)
+
+→
+
+ADWPI
+ADJOB (systemActive + RUN)
+
+
+→
+→
+
+
+Report status
+Stream (next batch) waypoints
+
+ADJOB (waypoint index)
+ADWPI
+
+→
+
+
+→
+→
+
+VP1 & VDS (GPS coords / speed / compass)
+DSSTAT (GPS correction available)
+
+DSAP (Anchor point)
+
+VP1 & VDS (GPS coords / speed / compass)
+DSSTAT (Autosteer engaged y/n)
+
+3. GPS coordinates
+The display will constantly forward the (transformed) GPS coordinates, using these 2 (SAE standard) messages – also when the AutoDrive system is
+not active. Note that the GPS coordinate presents the header-center at ground-level, which is not neccesarily the machine center if the head has an
+offset.
+
+If the signal drops, the Latitude & Longitude will be set the 0xFFFFFFFF (not available). Note that the compass bearing might be wrong or
+undetermined when when the machine didn’t move yet.
+
+4. Job Start
+Normally, DirectSteer would start a new job either manually or when entering another field (geofence). Starting a new job would:
+- Clear the coverage map
+(display keeps draws where the machine has been)
+- Resets lines
+- Compute an anchor point
+(typically the field center or the current machine point)
+o This anchor will be used to communicate coordinates in a local system, centimeters north / east relative to anchor
+Since this trigger may not be available now, the AutoDrive system will trigger instead. To do so,
+1. The AutoDrive system first has to await a valid (corrected) GPS signal, which may take a few minutes after the machine (re)starts.
+2. Machine must allow AutoDrive (fieldMode & option enabled by operator / machine)
+3. The machine must be inside the field
+4. Waypoints / line available
+
+(left) DirectSteer status (from Display). AutoDrive should check the GPS PPP available and AutoDrive allowed bits.
+(right) AutoDrive Job. Turn on the “systemActive” bit once the conditions are met (do NOT turn on RunCOmmand yet). If the AutoDrive system has a job
+ID, it can be communicated as well with the last 16 bits.
+
+If the SystemActive bits toggles on, the DirectSteer system will start a new job. This includes computing a (new) anchor point. Waypoint coordintes
+that will be streamed are ought to be relative to be relative to this anchor. This allows a more compact & easier to handle coördinate system.
+
+Be aware that 2 different machines may have 2 different anchor points!
+As long as the system is inactive, anchor longitude and latitude are set to 0xFFFFFFFF
+Once the anchor point has been received, the AutoDrive unit can start streaming waypoints. Bare in mind the “RunCommand” from the ADJOB
+message should remain off, as the display still doesn’t know (all) required waypoints yet.
+
+5. Streaming Waypoints towards the Display
+Once the anchor point has been set, the AutoDrive system can translate absolute GPS coordinates (degrees) to local-system coordinates, which are
+centimeters offset relative to the anchor. For example,
+{-51050 , +912 }
+
+means 510,5 meters west from the anchor, 9,12 meters north from the anchor
+
+A CAN message can only contain 1 point at a time, so an index number is given to tell which waypoint this is. Besides coordinates, it can carry
+additional information:
+• Is Headland point meaning the header should be lifted, and typically a (sharp) turn is coming so reduce the speed as well).
+• Is Reverse point
+meaning the machine has to travel in reverse to reach this point)
+• Reserved
+for future usage (speedlimit? Additional steer instructions?)
+
+Index[0] means the very first waypoint of the entire line. If the line has 6000 points in total (as communicated in the ADJOB message), Index[5999]
+would present the last point.
+•
+
+The system is allowed to stream ALL points, though it’s is also allowed to only stream 100 points at a time.
+o
+o
+
+So when passing point 75, stream the next 100 (see chapter 5.2)
+Or just stream the entire line if that is easier (the display will draw the entire line as well then). Be aware this takes some time though!
+
+•
+
+Streaming pace;
+o When streaming 100 points, PGN 0xFFCD needs to be sent 100 times as well, each time with different point index
+o Since only a relative small amount of CAN messages can be committed simultanously, it is recommended to pause 10 milliseconds
+after each message
+▪ So sending 100 points would require 1 second
+o Or if we prefer to send the entire line at once, say 20k points, it would take (20k / 100) = 200 seconds
+o If this is too slow; it is allowed to send the same PGN multiple times simultanously. For example:
+▪ 0 ms - send point1 & 2
+10 ms – send point 3 & 4 20 ms – send point 5 & 6 ….
+▪ This would reduce the streaming time by 50%
+o The system can engage when at least the first 100 points have been streamed (and it can keep streaming after that if preferred).
+
+•
+
+If the line changes on the fly, KEEP the passed points. For example:
+o
+o
+o
+o
+o
+
+•
+
+Machine just passed waypoint #2000
+The line suddenly changes
+Point 0..2000 should remain intact, as they were given before. Points 2001+ can be changed
+It is allowed to increase or reduce the point count’
+This means passed points don’t have to be re-communicated
+
+AgJunction curve path requirements:
+o
+
+AgJunction will (re)smooth the line for its own usage, nonetheless it is recommended to ensure Spacing and Angle limits as described in chapter 5.2
+
+The AutoSteer system will try to put the header-center on top of the steerline. Be aware that for machines with an excentric header position, the
+distancing between lines varies depending from which direction the machine is coming:
+
+Overlap, reel width (that is the actual picking reel inside (shaft-to-shaft), not the whole header) & lhTipDistance are broadcasted in the DSSTAT
+message:
+Overlap should be set BEFORE the job starts (typically a fixed setting at
+18..25 cm). It cannot be changed on the fly, as the whole path would
+require recomputation.
+The reel width is a constant value, depending on what type of header is
+mounted.
+The lhTipDistance can vary, if the head was shifted. It is the distance
+between the left reel shaft and the SteerLine (see picture above). So if
+the head was shifted to the right, the lhTipDistance becomes smaller
+than half of the reel width. Shifting does not affect where the lines
+should be, as the machine will adapt on the fly. Nonetheless the info is
+shared.
+
+5.2 Streaming Linepoints towards the AgJunction
+The AgJunction should(*) be able to follow a curved line, though it has certain requirements:
+
+Both the Display and AgJunction itself will smooth / rebuild the line, but it’s probably good if the AutoDrive ECU uses the same logic.
+* We noticed the machine having difficulties with following a curved line, eventually losing track and quitting autosteer as the AgJunction
+missed too many waypoints. Possible causes could be:
+- Too much “zig-zagging” on a relative short distance (we never used very sharp turns)
+- Wheels not steering quick enough (aggressive) enough on the propel (we can tweak that)
+- Streaming logic not properly implemented on the Display (see below)
+As curves are rarely used in normal use cases, we never put much effort in it. But likely this will require attention. As for the AutoDrive
+controller, we would recommend very gentle curves to begin with.
+
+When having a longer curved line (> 100 points), the Display must stream the coordinates to AgJunction:
+-
+
+Up to 100 points can be given at a time
+It must overlap with at least 3 points from the previous set – thus including 3 points we already passed
+
+6. Engage / Run Command & Tracking
+If the AutoDrive system is active, the machine will only drive & steer (automatically) while the “RunCommand” is active. The RunCommand is allowed
+to become true if:
+-
+
+GPS PPP correction is available & Machine allows AutoDrive (see DSSTAT message)
+System was activated before
+System streamed at least 100 points
+
+So when switching on the contact or entering a field, it may take a while before the Run command can be given. Note at this point, the machine might
+be off the intended line. For a first try, it is recommended to put the machine right in front of the starting point. AgJunction can steer towards the line to
+some extend, but shouldn’t start too far away.
+Once the “RunCommand” turns on, the machine will drive forward (or in reverse if the next point says so) slowly (1 kph), as AgJunction cannot activate
+without driving first. After a short delay, the AutoSteer Engage request will be sent towards AgJunction. When the AutoSteer system is actually
+engaged, it will report back (see right message, “AutoSteer Engaged”):
+
+This means that:
+- The first meter(s), the machine has no waypoint yet, it will simply drive forward
+o This can be problematic if the machine was halted during a curve !
+- The feedback “AutoSteer Engaged = TRUE” status might be a few seconds after the RunCommand was given
+If the autosteer refuses to engage for whatever reason, the machine will halt and report an “AutoSteer interrupt/reject” code (which resembles a
+certain reason such as manually overrided, bad GPS signal, cannot acquire line, et cetera). If this happens, the system can try again by resetting the
+RunCommand, and otherwise an operator is needed.
+During the ride, the AutoDrive system can also ask the machine to halt by turning off the RunCommand – for example if the machine needs to unload
+or receive a line update first. Resume by turning on the RunCommand again – but be aware that the same initial meters & delay are applied as written
+above; it may pass a few waypoints before it actually engaged & it might be slightly off the line by then!
+The AutoDrive system can report the current waypoint index (“progress”) back with the ADJOB message. Also if the AutoDrive system stopped working
+for whatever reason, it can use this message to raise an error. Once again, the machine will halt if the errorCode field is not 0.
+
+
