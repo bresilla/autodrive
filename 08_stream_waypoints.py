@@ -2,17 +2,17 @@
 """
 Step 08 — stream a rolling window of waypoints (ADWPI).
 
-Goal: once anchored, send the route as ADWPI frames using the 100-point window
-with 3-point overlap and 10 ms pacing.
+Goal: once anchored, send the route as ADWPI frames in one batch (TARGET_POINTS,
+currently 120) with 3-point overlap and 10 ms pacing.
 
 What this step proves:
-  * batching: stream the next ~100 points, overlapping the previous batch by 3
-  * pacing: pause 10 ms after each frame (100 points ≈ 1 second)
+  * batching: stream the first TARGET_POINTS, overlapping the previous batch by 3
+  * pacing: pause 10 ms after each frame (120 points ≈ 1.2 seconds)
   * the "engage after ≥100 points streamed" rule lives here
 
-The route is the line.geojson test line. It is short, so we resample it finely
-enough to yield at least 100 points (kept inside the AgJunction 0.3-4.5 m band),
-so the first window is a full 100-point batch.
+The route is the short line.geojson test line, resampled finely enough to yield
+TARGET_POINTS so the first batch hits that count. At 120 points on this line the
+spacing dips just under the AgJunction 0.3 m minimum — fine for drawing the line.
 
 Run:
     ./08_stream_waypoints.py
@@ -33,21 +33,21 @@ import routes
 # Datum is taken from the loaded route's first vertex in main(); placeholder here.
 DATUM_LAT, DATUM_LON = 0.0, 0.0
 
-MIN_POINTS = a.FUTURE_POINT_COUNT   # we want a full window (100) on the first batch
+TARGET_POINTS = 120                 # how many waypoints we want to stream
 MIN_SPACING_M = 0.3                 # AgJunction minimum point spacing (PROTOCOL.md §8.5)
 
 
-def load_line_with_min_points(min_points: int):
-    """Load line.geojson, resampled fine enough to reach `min_points` (clamped to
-    the AgJunction spacing band). Returns (route, datum_lat, datum_lon, spacing_m)."""
+def load_line_with_points(target: int):
+    """Load line.geojson resampled to ~`target` points (spacing = length/(target-1)).
+    Returns (route, datum_lat, datum_lon, spacing_m)."""
     path = routes.geojson_path("line")
-    route, dlat, dlon = routes.geojson_route(path)
-    length = sum(math.hypot(route[i + 1].x - route[i].x, route[i + 1].y - route[i].y)
-                 for i in range(len(route) - 1))
-    spacing = routes.WAYPOINT_SPACING_M
-    if len(route) < min_points and length > 0:
-        spacing = max(MIN_SPACING_M, length / min_points)
-        route, dlat, dlon = routes.geojson_route(path, spacing_m=spacing)
+    base, dlat, dlon = routes.geojson_route(path)
+    length = sum(math.hypot(base[i + 1].x - base[i].x, base[i + 1].y - base[i].y)
+                 for i in range(len(base) - 1))
+    if length <= 0 or target < 2:
+        return base, dlat, dlon, routes.WAYPOINT_SPACING_M
+    spacing = length / (target - 1)
+    route, dlat, dlon = routes.geojson_route(path, spacing_m=spacing)
     return route, dlat, dlon, spacing
 
 
@@ -60,10 +60,10 @@ def build_waypoints(route, anchor_lat, anchor_lon):
             for i, p in enumerate(route)]
 
 
-def stream_window(bus, status, waypoints, current_index):
-    """Send waypoints[current-overlap : current+100], 10 ms apart."""
+def stream_window(bus, status, waypoints, current_index, count=TARGET_POINTS):
+    """Send waypoints[current-overlap : current+count], 10 ms apart."""
     start = max(0, current_index - a.WINDOW_OVERLAP_POINTS)
-    end = min(len(waypoints), current_index + a.FUTURE_POINT_COUNT)
+    end = min(len(waypoints), current_index + count)
     sent = 0
     for wp in waypoints[start:end]:
         a.drain_rx(bus, status, max_frames=5)
@@ -76,11 +76,12 @@ def stream_window(bus, status, waypoints, current_index):
 
 def main() -> None:
     global DATUM_LAT, DATUM_LON
-    route, DATUM_LAT, DATUM_LON, spacing = load_line_with_min_points(MIN_POINTS)
-    print(f"line route: {len(route)} points at {spacing:.2f} m spacing", file=sys.stderr)
-    if len(route) < MIN_POINTS:
-        print(f"warning: line is too short to reach {MIN_POINTS} points even at the "
-              f"{MIN_SPACING_M} m minimum spacing — streaming {len(route)}.", file=sys.stderr)
+    route, DATUM_LAT, DATUM_LON, spacing = load_line_with_points(TARGET_POINTS)
+    print(f"line route: {len(route)} points at {spacing:.3f} m spacing "
+          f"(target {TARGET_POINTS})", file=sys.stderr)
+    if spacing < MIN_SPACING_M:
+        print(f"note: {spacing:.3f} m spacing is below the AgJunction {MIN_SPACING_M} m "
+              f"minimum (fine for drawing the line; tighten the route to fix).", file=sys.stderr)
     bus = a.make_bus()
     status = a.MachineStatus()
 
@@ -107,7 +108,7 @@ def main() -> None:
           f"(~{sent * a.SEND_INTERVAL_S:.1f}s of bus time)")
     print("first 3 points already passed are re-sent as overlap on the next window.")
     if sent >= a.FUTURE_POINT_COUNT:
-        print(f"\n{sent} ≥ {a.FUTURE_POINT_COUNT} points streamed → RunCommand is now "
+        print(f"\n{sent} points streamed (≥ {a.FUTURE_POINT_COUNT}) → RunCommand is now "
               f"allowed (step 09).")
     else:
         print(f"\n{sent} < {a.FUTURE_POINT_COUNT} points streamed → RunCommand NOT yet "
