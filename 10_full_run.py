@@ -15,8 +15,9 @@ Loop (see PROTOCOL.md §7):
       → convert route to anchor-relative cm
       → stream ADWPI windows, raise RunCommand, track progress via ADJOB
 
-⚠️ On a real machine THIS MOVES THE MACHINE. Area clear, e-stop in hand,
-   machine placed right in front of the route's start point.
+⚠️ On a real machine the RunCommand does NOT drive it yet (PROTOCOL.md §9) — you
+   drive forward on the joystick (1-2 kph, flying start) and AutoSteer only steers.
+   Area clear, e-stop in hand. On the bench the simulator drives for you.
 
 Run:
     ./10_full_run.py

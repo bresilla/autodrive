@@ -68,6 +68,8 @@ class DisplayModel:
         self.system_active = False
         self.run_command = False
         self.run_started_t: float | None = None
+        self.job_id: int | None = None
+        self.jobs_started = 0
 
         self.anchor_lat: float | None = None
         self.anchor_lon: float | None = None
@@ -89,11 +91,20 @@ class DisplayModel:
     def _on_adjob(self, data: bytes) -> None:
         self.system_active = (data[1] & 0x03) == 0x01
         self.run_command = (data[1] & 0x0C) == 0x04
-        if self.system_active and self.anchor_lat is None:
+        job_id = struct.unpack_from("<H", data, 6)[0]
+
+        # A change of Job ID while SystemActive starts a NEW job (spec2.md): the
+        # display recomputes the anchor, clears the map, resets the line.
+        if self.system_active and job_id != self.job_id:
+            self.job_id = job_id
+            self.jobs_started += 1
             self.anchor_lat = self.machine_lat      # job start: anchor = current position
             self.anchor_lon = self.machine_lon
-            print(f"  [sim] job started; anchor = {self.anchor_lat:.7f},{self.anchor_lon:.7f}",
-                  file=sys.stderr)
+            self.waypoints.clear()
+            self.target_index = 0
+            self._next[a.PGN_DSAP] = self.t         # broadcast the new anchor promptly
+            print(f"  [sim] job #{self.jobs_started} started: id={job_id}, anchor = "
+                  f"{self.anchor_lat:.7f},{self.anchor_lon:.7f}", file=sys.stderr)
         if self.run_command and self.run_started_t is None:
             self.run_started_t = self.t
             print("  [sim] RunCommand received", file=sys.stderr)

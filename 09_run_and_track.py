@@ -2,9 +2,9 @@
 """
 Step 09 — run command, progress tracking, and re-streaming.
 
-Goal: the full control loop on a built-in test line. Activate, stream the first
-window, raise RunCommand, watch the machine move, track progress from its GPS,
-and re-stream the window as it advances.
+Goal: the full control loop on the line.geojson test line. Activate, stream the
+first window, raise RunCommand, track progress from GPS, and re-stream the window
+as the machine advances.
 
 What this step proves:
   * the run gate: RunCommand may turn on only after ≥100 points streamed
@@ -12,7 +12,9 @@ What this step proves:
   * re-sending the rolling window so points ahead are always known
   * reporting progress in ADJOB's current-index field
 
-⚠️ On a real machine THIS MOVES THE MACHINE. Area clear, e-stop in hand.
+⚠️ On a real machine the RunCommand does NOT drive it yet (PROTOCOL.md §9) — you
+   drive forward on the joystick (1-2 kph, flying start) and AutoSteer only steers.
+   Area clear, e-stop in hand. On the bench the simulator drives for you.
 
 Run:
     ./09_run_and_track.py

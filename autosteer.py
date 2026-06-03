@@ -32,8 +32,8 @@ import time
 CAN_BUS = os.environ.get("CAN_BUS", "vcan0")
 
 J1939_PRIORITY = 6
-SOURCE_DISPLAY = 40           # the cab display
-SOURCE_AUTODRIVE = 29         # us — proposal marks this "29 ?"; verify with vendor
+SOURCE_DISPLAY = 40           # the cab display (source 0x28), confirmed by spec/spec2.md
+SOURCE_AUTODRIVE = 29         # us = the In Field Planner (source 0x1D), confirmed by spec/spec2.md
 
 # PGNs (see PROTOCOL.md §4)
 PGN_VP1 = 0xFEF3              # NOT 0xFFEF — common transcription trap
@@ -43,7 +43,8 @@ PGN_DSAP = 0xFFCB
 PGN_ADJOB = 0xFFCC
 PGN_ADWPI = 0xFFCD
 
-# ADWPI 20-bit packed coordinate (see PROTOCOL.md §5.2)
+# ADWPI 20-bit packed coordinate (see PROTOCOL.md §5.2). The offset is -250000 cm,
+# confirmed by spec/spec2.md — the spec sheet's earlier -25000 was an error.
 ADWPI_COORD_OFFSET_CM = -250_000
 ADWPI_COORD_RAW_MAX = (1 << 20) - 1
 

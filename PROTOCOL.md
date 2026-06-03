@@ -8,9 +8,12 @@ bring-up scripts here (`01_*.py` … `10_full_run.py`) and the shared library
 Source of truth: [`spec/GP_AutoDrive_CanMessageProposal_V10.pdf`](spec/GP_AutoDrive_CanMessageProposal_V10.pdf).
 This document is the prose explanation; the PDF is the authoritative byte tables.
 
-> Status note: a few fields in the proposal are marked uncertain (`29 ?` source
-> address, the `Current Direction` reverse value, an inconsistent ADWPI offset
-> annotation). Those are flagged inline as **⚠ verify with vendor**.
+> Status note: the field checklist [`spec/spec2.md`](spec2.md) (2 Jun 2026)
+> resolved several items the original proposal left uncertain — the source
+> address (we are **29 / `0x1D`**), the ADWPI offset (**−250000 cm**), and that
+> the **RunCommand is not yet wired** (the machine is driven by hand; AutoSteer
+> only steers). Two items remain open and are flagged inline as **⚠ verify with
+> vendor**: the `Current Direction` reverse value and the ADWPI byte-8 flag bits.
 
 ---
 
@@ -79,7 +82,8 @@ trucking. It carves the 29-bit ID into fields:
 
 - **Priority** — 0 (highest) to 7. This protocol uses **6** for every message.
 - **PGN** — *what kind of message this is*. E.g. ADWPI = PGN 65485 = `0xFFCD`.
-- **Source Address (SA)** — *who sent it*. Display = **40**; AutoDrive = **29** (⚠ verify).
+- **Source Address (SA)** — *who sent it*. Display = **40** (`0x28`); AutoDrive =
+  **29** (`0x1D`, the "In Field Planner"). Both confirmed by [`spec/spec2.md`](spec2.md).
 
 Building the ID (from the script, `j1939_id`):
 
@@ -231,10 +235,11 @@ byte7 = north[19:12]
 Range: 20 bits = 0…1048575 raw → −250000…+798575 cm → roughly **−2.5 km … +8.0 km**
 from the anchor.
 
-> **Offset annotation caveat.** The PDF labels the offset "−250000 cm (−25 km)".
-> −250000 cm is −2.5 km, not −25 km, and 20 bits cannot span 25 km anyway. The
-> numeric value (−250000 cm) is what we implement; the "(−25 km)" parenthetical is a
-> typo. ⚠ Confirm with vendor if you ever approach the range limits.
+> **Offset confirmed.** The original spec sheet had **−25000 cm**, which was an
+> error; the field checklist ([`spec/spec2.md`](spec2.md)) corrects it to
+> **−250000 cm** — the value we implement. The accompanying "25 km" gloss is
+> imprecise (−250000 cm is 2.5 km, and 20 bits can't span 25 km anyway), but the
+> numeric offset is right.
 
 ---
 
@@ -310,8 +315,8 @@ Our job-state heartbeat. Sent every 1 s or on state change.
 | 2    | 8-5  | Error code           | 4-bit nibble, 0 = ok (machine halts if ≠ 0) |
 | 2    | 4-3  | RunCommand           | 2-bit, on = `01` → `0x04` |
 | 2    | 2-1  | SystemActive         | 2-bit, on = `01` → `0x01` |
-| 3-4  | —    | Current waypoint index | u16, progress (e.g. #1403 of #5000) |
-| 5-6  | —    | Line total point count | u16 |
+| 3-4  | —    | Current waypoint index | u16, the point we are **going to** (0 = first), *not* the last passed point |
+| 5-6  | —    | Line total point count | u16, **≤ 65530** |
 | 7-8  | —    | Job ID               | u16, 0…65530 |
 
 Encoder: `encode_adjob`. The byte2 packing is the most error-prone part:
@@ -322,6 +327,16 @@ b[1] = ((error_code & 0x0F) << 4) | (0x04 if run_command else 0) | (0x01 if syst
 
 > Earlier the script used `0x08` for RunCommand. In a 2-bit field at bits 4-3, `0x08`
 > is the pattern `10` = **error**, not `01` = on. Use `0x04`. Now fixed.
+
+> **Job ID starts the job** (per [`spec/spec2.md`](spec2.md)). The Job ID must
+> change when you move to a different field; a **change of Job ID together with
+> SystemActive** is what makes the display start a *new* job (recompute anchor,
+> clear the coverage map). The scripts use a fixed Job ID for a single field.
+>
+> **SystemActive** means, to the display: we have confirmed *PPP ready* and have
+> *lines ready to stream*. **Current waypoint index** is the point the machine is
+> heading toward (index `0` = the very first), which is what the display
+> highlights and what we later feed to the AgJunction.
 
 ### 6.6 ADWPI — AutoDrive Waypoint Info  (`0xFFCD`, **TX**)
 
@@ -378,7 +393,8 @@ The choreography from the proposal's sequence table:
                                    ▼
 ┌─ Run ────────────────────────────────────────────────────────────────────────┐
 │  AutoDrive TX: ADJOB (systemActive=TRUE + RunCommand=TRUE)                    │
-│  Machine drives 1 kph, then AutoSteer engages                                │
+│  Operator drives forward 1-2 kph (RunCommand not wired yet, §9);             │
+│  AutoSteer then engages and steers                                            │
 │  Display  RX:  DSSTAT (AutoSteer engaged = true), VP1/VDS                     │
 └──────────────────────────────────────────────────────────────────────────────┘
                                    │  as machine advances
@@ -449,9 +465,14 @@ each frame** (`SEND_INTERVAL_S = 0.010`). Therefore:
 ### 8.3 Progress tracking
 
 The machine's current index is estimated from GPS by nearest-point search over a small
-window of the route, monotonic (never goes backwards) — `estimate_current_index`,
-bounded by `NEAREST_SEARCH_BACKTRACK` / `NEAREST_SEARCH_AHEAD`. That index drives both
-the ADJOB progress field and where the next ADWPI window starts.
+window of the route, monotonic (never goes backwards) — `estimate_index`, bounded by
+`NEAREST_BACKTRACK` / `NEAREST_AHEAD`. That index drives both the ADJOB progress field
+(the point we report we are heading *to*, §6.5) and where the next ADWPI window starts.
+
+> Keep `NEAREST_AHEAD` small (≈25 points). A search window wider than the machine's
+> real per-step advance can snap onto a **parallel leg** of the route — the legs of a
+> headland turn are only metres apart — and the monotonic clamp then makes that wrong
+> jump permanent.
 
 ### 8.4 Line changes on the fly
 
@@ -476,21 +497,30 @@ recommends **gentle curves only** to start.
 
 ## 9. Engage, run, and tracking
 
-Once `RunCommand` turns on:
+> **RunCommand is not wired yet.** Per the field checklist
+> ([`spec/spec2.md`](spec2.md)), the display currently does **nothing** with our
+> RunCommand bit (you can exercise it from the display's Diagnose screen, but it
+> does not propel the machine). So forward motion is **manual** — the operator
+> drives the joystick — while the AgJunction does the **steering**. We still send
+> RunCommand so the protocol is in place for when it is enabled. The bench
+> simulator, by contrast, *does* drive the virtual machine on RunCommand so the
+> loop can be rehearsed end to end.
 
-- The machine creeps forward at **~1 kph** first — the AgJunction cannot engage from
-  a standstill. **The first metre or two has no waypoint guidance**; it just drives
-  straight. *This is dangerous if the machine was halted mid-curve.*
-- After a short delay, the AutoSteer engage request goes to the AgJunction. When it
-  actually engages, `DSSTAT` reports **AutoSteer engaged = true** — possibly a few
-  seconds after RunCommand.
-- For a first run, **place the machine right in front of the start point**. AgJunction
-  can steer onto the line from a small offset but not from far away.
+How a run actually goes today:
 
-**Halting and resuming.** Turn `RunCommand` **off** to halt (e.g. to unload or accept
-a line update). Resume by turning it on again — but the same creep-forward + engage
-delay applies, so the machine may pass a few waypoints and be slightly off-line before
-re-engaging.
+- The AgJunction cannot engage from a standstill, so make a **flying start**: park
+  ~5 m before the first point, drive straight at it on the joystick, and engage
+  AutoSteer as you reach the point. **The first metre or two has no guidance.**
+- Drive **slowly, 1–2 kph** — earlier curve tests were rough; turning the steering
+  PID up may help. When AutoSteer actually engages, `DSSTAT` reports **AutoSteer
+  engaged = true** (possibly a few seconds later). It's not guaranteed the
+  AgJunction follows a curved line cleanly.
+- **PPP must be true RTK** (the RTK icon purple) — a FLOAT fix is *not* good enough.
+
+**Halting and resuming.** Ease off the joystick to stop. (Resetting the
+`RunCommand` bit is how the AutoDrive side will halt once it is wired.) On resume,
+the same flying-start caveat applies: the machine may pass a few waypoints and be
+slightly off-line before re-engaging.
 
 **Errors.** If AutoSteer refuses to engage, the machine halts and DSSTAT byte2 carries
 an **interrupt/reject reason** code (manual override, bad GPS, cannot acquire line, …).
@@ -558,13 +588,14 @@ the step-by-step runbook):
 - [ ] **Stream first 100.** Send ADWPI window; verify the display draws the line in
       the right place (anchor-relative cm math is the usual culprit if it's offset or
       mirrored — check east/north sign and the 20-bit packing).
-- [ ] **Run.** Set RunCommand (`0x04`), confirm creep-forward then AutoSteer engaged
-      in DSSTAT. **Have a person at the e-stop.**
+- [ ] **Run.** Set RunCommand (`0x04`). It does **not** move the machine yet (§9) —
+      drive forward manually (1–2 kph, flying start) and confirm AutoSteer engaged in
+      DSSTAT. **Have a person at the e-stop.**
 - [ ] **Track.** Confirm ADJOB progress index advances and windows re-stream with the
       3-point overlap.
-- [ ] **⚠ Resolve vendor unknowns:** AutoDrive source address (`29 ?`), Current
-      Direction reverse value, ADWPI offset annotation, exact byte-8 flag bit
-      positions.
+- [ ] **⚠ Resolve remaining vendor unknowns:** DSSTAT Current Direction reverse value,
+      and the exact byte-8 flag bit positions. (Source address `29`/`0x1D` and the
+      −250000 cm offset are confirmed by [`spec/spec2.md`](spec2.md).)
 
 ---
 
