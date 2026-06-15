@@ -24,7 +24,7 @@ What it does:
   * watches incoming ADJOB: when SystemActive flips on it computes an anchor
     (the current machine position) and starts emitting DSAP,
   * collects incoming ADWPI and, once RunCommand is on, drives a virtual machine
-    along them, reporting AutoSteer engaged after a short delay,
+    along them, reporting AutoDrive engaged after a short delay,
   * feeds the moving machine position back out via VP1/VDS so the client's
     progress tracking advances.
 
@@ -38,7 +38,7 @@ import struct
 import sys
 import time
 
-import autosteer as a
+import autodrive as a
 import routes
 
 
@@ -63,7 +63,7 @@ class DisplayModel:
         self.speed_kph = 0.0
 
         self.autodrive_allowed = True
-        self.autosteer_engaged = False
+        self.autodrive_engaged = False
 
         self.system_active = False
         self.run_command = False
@@ -110,7 +110,7 @@ class DisplayModel:
             print("  [sim] RunCommand received", file=sys.stderr)
         if not self.run_command:
             self.run_started_t = None
-            self.autosteer_engaged = False
+            self.autodrive_engaged = False
 
     # -- tick: advance physics + return scheduled outbound frames -------------
 
@@ -137,11 +137,11 @@ class DisplayModel:
 
     def _drive(self, dt: float) -> None:
         if self.run_command and self.run_started_t is not None:
-            if self.t - self.run_started_t >= ENGAGE_DELAY_S and not self.autosteer_engaged:
-                self.autosteer_engaged = True
-                print("  [sim] AutoSteer engaged", file=sys.stderr)
+            if self.t - self.run_started_t >= ENGAGE_DELAY_S and not self.autodrive_engaged:
+                self.autodrive_engaged = True
+                print("  [sim] AutoDrive engaged", file=sys.stderr)
 
-        if not (self.run_command and self.autosteer_engaged and self.anchor_lat is not None
+        if not (self.run_command and self.autodrive_engaged and self.anchor_lat is not None
                 and self.waypoints):
             self.speed_kph = 0.0
             return
@@ -199,8 +199,8 @@ class DisplayModel:
         b = bytearray(8)
         if self._ppp():
             b[0] |= 0x40                          # GPS PPP available = 01 @ bits 8-7
-        if self.autosteer_engaged:
-            b[0] |= 0x10                          # AutoSteer engaged = 01 @ bits 6-5
+        if self.autodrive_engaged:
+            b[0] |= 0x10                          # AutoDrive engaged = 01 @ bits 6-5
         if self.autodrive_allowed:
             b[1] |= 0x01                          # AutoDrive allowed = 01 @ bits 2-1
         return self._frame(a.PGN_DSSTAT, bytes(b))

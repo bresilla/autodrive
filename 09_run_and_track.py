@@ -13,7 +13,7 @@ What this step proves:
   * reporting progress in ADJOB's current-index field
 
 ⚠️ On a real machine the RunCommand does NOT drive it yet (PROTOCOL.md §9) — you
-   drive forward on the joystick (1-2 kph, flying start) and AutoSteer only steers.
+   drive forward on the joystick (1-2 kph, flying start) and AutoDrive only steers.
    Area clear, e-stop in hand. On the bench the simulator drives for you.
 
 Run:
@@ -29,7 +29,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import autosteer as a
+import autodrive as a
 import routes
 
 # Datum is taken from the loaded route's first vertex in main(); placeholder here.
@@ -125,7 +125,7 @@ def main() -> None:
                 total_points=len(waypoints) if waypoints else len(route)))
             if waypoints:
                 print(f"[{now:5.1f}s] progress {current_index:3}/{len(waypoints)}  "
-                      f"engaged={'Y' if status.autosteer_engaged else '-'}  "
+                      f"engaged={'Y' if status.autodrive_engaged else '-'}  "
                       f"spd={status.speed_kph:4.1f}kph")
 
         if waypoints and current_index >= len(waypoints) - 1:

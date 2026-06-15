@@ -1,7 +1,7 @@
 """
 routes.py — routes for bench and field runs.
 
-Two sources, same output type — a list of autosteer.RoutePoint in local ENU
+Two sources, same output type — a list of autodrive.RoutePoint in local ENU
 metres (x = east, y = north) with is_headland / is_reverse flags:
 
   * GeoJSON LineStrings (line.geojson, u_field.geojson) — real paths in WGS84,
@@ -17,7 +17,7 @@ import json
 import math
 import os
 
-import autosteer as a
+import autodrive as a
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 

@@ -29,7 +29,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import autosteer as a
+import autodrive as a
 
 JOB_IDS = [201, 202, 203]   # one job per "field"
 ACTIVE_S = 3.0              # hold each job active

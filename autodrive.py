@@ -1,5 +1,5 @@
 """
-autosteer.py — shared GP AutoDrive protocol library.
+autodrive.py — shared GP AutoDrive protocol library.
 
 This is the single source of truth for the numbered bring-up scripts in this
 folder (01_..., 02_..., ...). Each script imports the pieces it needs from here
@@ -96,7 +96,7 @@ class MachineStatus:
     heading_deg: float | None = None
     gps_ppp_available: bool = False
     autodrive_allowed: bool = False
-    autosteer_engaged: bool = False
+    autodrive_engaged: bool = False
     header_down: bool = False
     current_direction_reverse: bool = False
     reject_reason: int = 0
@@ -186,7 +186,7 @@ def decode_dsstat(data: bytes, status: MachineStatus) -> None:
     b1 = data[0]
     b2 = data[1]
     status.gps_ppp_available = (b1 & 0xC0) == 0x40          # bits 8-7
-    status.autosteer_engaged = (b1 & 0x30) == 0x10          # bits 6-5
+    status.autodrive_engaged = (b1 & 0x30) == 0x10          # bits 6-5
     status.header_down = (b1 & 0x0C) == 0x04                # bits 4-3
     status.current_direction_reverse = (b1 & 0x03) == 0x01  # bits 2-1, verify value
     status.autodrive_allowed = (b2 & 0x03) == 0x01          # byte2 bits 2-1

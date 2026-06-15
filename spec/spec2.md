@@ -28,7 +28,7 @@ b. Source 0x28 (40) zijn wij zelf. Berichten van belang voor WUR zijn:
 i. VEP1 (gps lat / long)
 ii. VDS (kompas, groundspeed, altitude, pitch)
 iii. DSAP (ankerpunt lat / long – dus het nulpunt)
-iv. DSSTAT (huidige richting, PPP ready, autosteer engaged, …)
+iv. DSSTAT (huidige richting, PPP ready, AutoDrive engaged, …)
 c. Source 0x1D (29) is de In Field Planner. Berichten van belang zijn:
 i. 0xFFCC (staat geen naam bij mij, maar het zou ADJOB moeten zijn).
 1. System Active (= PPP ready ontvangen van ons & lijnen
@@ -102,4 +102,4 @@ o LANGZAAM rijden dus (maar ook niet te langzaam, zeg 1 a 2 kph)
 o Wellicht de PID regelaar opschroeven om het sturen FEL te krijgen
 Je zult een vliegende start moeten maken waarschijnlijk;
 - Parkeer 5 meter voor het (1e) lijn punt
-- Rij er recht op af, activeer autosteer zodra je het punt bereikt
+- Rij er recht op af, activeer AutoDrive zodra je het punt bereikt

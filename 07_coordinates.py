@@ -25,7 +25,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import autosteer as a
+import autodrive as a
 import routes
 
 # The real U-turn field path (u_field.geojson). Its datum is the route start.

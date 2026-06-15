@@ -13,10 +13,10 @@ What this step proves:
         - GPS PPP available
         - AutoDrive allowed
     * Feedback/status:
-        - AutoSteer engaged
+        - AutoDrive engaged
         - header down
         - current direction
-        - AutoSteer reject/interruption reason
+        - AutoDrive reject/interruption reason
 
 Expected 2-bit status encoding:
     00 = off / false
@@ -26,11 +26,11 @@ Expected 2-bit status encoding:
 
 DSSTAT layout:
     Byte 1 bits 8-7: GPS PPP available
-    Byte 1 bits 6-5: AutoSteer engaged
+    Byte 1 bits 6-5: AutoDrive engaged
     Byte 1 bits 4-3: Header down
     Byte 1 bits 2-1: Current direction
 
-    Byte 2 bits 8-3: AutoSteer interrupt / reject reason
+    Byte 2 bits 8-3: AutoDrive interrupt / reject reason
     Byte 2 bits 2-1: AutoDrive allowed
 
 Run:
@@ -45,7 +45,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import autosteer as a
+import autodrive as a
 
 LISTEN_SECONDS = 6.0
 PRINT_PERIOD = 0.5
@@ -68,7 +68,7 @@ def show(status: a.MachineStatus, t: float) -> None:
         f"[{t:4.1f}s] "
         f"PPP={yn(status.gps_ppp_available)} "
         f"allowed={yn(status.autodrive_allowed)} "
-        f"engaged={yn(status.autosteer_engaged)} "
+        f"engaged={yn(status.autodrive_engaged)} "
         f"header_down={yn(status.header_down)} "
         f"reverse={yn(status.current_direction_reverse)} "
         f"reject={status.reject_reason}"
@@ -124,7 +124,7 @@ def main() -> None:
 
     print()
     print("Feedback:")
-    print(f"  AutoSteer engaged : {yn(status.autosteer_engaged)}")
+    print(f"  AutoDrive engaged : {yn(status.autodrive_engaged)}")
     print(f"  Header down       : {yn(status.header_down)}")
     print(f"  Reverse           : {yn(status.current_direction_reverse)}")
     print(f"  Reject reason     : {status.reject_reason}")

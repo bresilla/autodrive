@@ -1,4 +1,4 @@
-# AutoSteer — GP AutoDrive bring-up runbook
+# AutoDrive — GP AutoDrive bring-up runbook
 
 A self-contained implementation of the GP (Oxbo) AutoDrive CAN protocol, plus a
 **step-by-step commissioning procedure** for a real machine. You run the scripts
@@ -12,13 +12,13 @@ path) and [`u_field.geojson`](u_field.geojson) (a U-shaped path with a turn) shi
 as the two test routes; [`routes.py`](routes.py) resamples them to ~0.5 m and
 flags the headland turn. Drop in your own GeoJSON line to drive a real field. The
 byte reference for everything is **[PROTOCOL.md](PROTOCOL.md)**; the protocol code
-is in **[`autosteer.py`](autosteer.py)**.
+is in **[`autodrive.py`](autodrive.py)**.
 
 > ⚠️ **SAFETY.** Steps 1–8 are passive or only transmit data — the machine does
 > not move. **In steps 9–10 the machine steers itself** once it is on the line.
 > Per the field checklist ([`spec/spec2.md`](spec/spec2.md)) the **RunCommand
 > does nothing yet** on the real machine — *you* push the joystick forward (1–2
-> kph) and AutoSteer only takes over the **steering**. From step 9 on: clear the
+> kph) and AutoDrive only takes over the **steering**. From step 9 on: clear the
 > area, keep a hand on the e-stop, and have a second person watching. (On the
 > bench the simulator drives the virtual machine for you, so the loop still runs
 > end to end.)
@@ -94,7 +94,7 @@ bus.
 
 4. The AutoDrive **source address** is **29 (`0x1D`)** — confirmed as the "In
    Field Planner" by [`spec/spec2.md`](spec/spec2.md) and set in
-   [`autosteer.py`](autosteer.py) (`SOURCE_AUTODRIVE`).
+   [`autodrive.py`](autodrive.py) (`SOURCE_AUTODRIVE`).
 
 ---
 
@@ -243,19 +243,19 @@ Watch the **display's map**.
 
 > **STOP.** Area clear. E-stop in hand. Second person watching. **Flying start:**
 > park ~5 m before the line's start point and drive straight at it, then activate
-> AutoSteer as you reach the point (the AgJunction can't engage from a standstill).
+> AutoDrive as you reach the point (the AgJunction can't engage from a standstill).
 
 `09_run_and_track.py` runs the full loop on a straight test line: activate →
 stream first window → raise **RunCommand** → track progress from GPS and re-stream
 the window as the machine advances. **The RunCommand does not move the machine** —
-you push the joystick forward yourself (1–2 kph); once on the line AutoSteer
+you push the joystick forward yourself (1–2 kph); once on the line AutoDrive
 engages and handles the steering. On the bench the simulator drives for you.
 
 ```sh
 ./09_run_and_track.py
 ```
 
-- ✅ **PASS:** with you driving forward, AutoSteer follows the line, `engaged=Y`,
+- ✅ **PASS:** with you driving forward, AutoDrive follows the line, `engaged=Y`,
   progress climbs to the end, **no reject code** (DSSTAT reject reason stays 0).
 - ❌ **FAIL / ABORT:** doesn't engage + a **reject reason** → read it (PROTOCOL.md
   §9); reset RunCommand and retry. Steers wrong / off the line → **e-stop now**,
@@ -280,7 +280,7 @@ route: `./simulator.py vcan0 uturn`.
 ./10_full_run.py
 ```
 
-- ✅ **PASS:** with you driving forward, AutoSteer follows the whole route
+- ✅ **PASS:** with you driving forward, AutoDrive follows the whole route
   including the turn, the headland flag shows over the curve, progress tracked,
   no reject codes.
 - ❌ **FAIL:** same diagnosis as step 9. Curves were *rough* in earlier field
@@ -315,7 +315,7 @@ route: `./simulator.py vcan0 uturn`.
 | [`PROTOCOL.md`](PROTOCOL.md) | Protocol reference — every PGN, byte, bit, the sequence. |
 | [`spec/GP_AutoDrive_CanMessageProposal_V10.pdf`](spec/GP_AutoDrive_CanMessageProposal_V10.pdf) | The authoritative vendor proposal (byte tables). A plain-text extract sits beside it at [`spec/GP_AutoDrive_CanMessageProposal_V10.txt`](spec/GP_AutoDrive_CanMessageProposal_V10.txt). |
 | [`spec/spec2.md`](spec/spec2.md) | Field bring-up checklist (2 Jun 2026). Resolves the source address, the −250000 cm offset, and that RunCommand is not yet wired. |
-| [`autosteer.py`](autosteer.py) | Shared library: encoders/decoders, J1939, CAN transport. `SOURCE_AUTODRIVE` lives here. |
+| [`autodrive.py`](autodrive.py) | Shared library: encoders/decoders, J1939, CAN transport. `SOURCE_AUTODRIVE` lives here. |
 | [`routes.py`](routes.py) | Loads GeoJSON routes (`geojson_route`): resample + headland flagging. Synthetic `straight_line()`/`u_turn()` remain as fallbacks. |
 | [`line.geojson`](line.geojson), [`u_field.geojson`](u_field.geojson) | The two test routes (WGS84 `LineString`s). Swap in your own field path here. |
 | [`simulator.py`](simulator.py) | Fake Display — `./simulator.py [channel] [route]` on `vcan0` for bench testing. |
@@ -329,7 +329,7 @@ route: `./simulator.py vcan0 uturn`.
   display is **40 (`0x28`)**. (`SOURCE_AUTODRIVE` / `SOURCE_DISPLAY`.)
 - ADWPI coordinate **offset is −250000 cm** — the spec sheet's earlier −25000 was
   an error. (The "25 km" gloss is loose; −250000 cm is 2.5 km.)
-- **RunCommand does nothing yet** — the machine is driven manually; AutoSteer only
+- **RunCommand does nothing yet** — the machine is driven manually; AutoDrive only
   steers. The display also ignores us until waypoint streaming pauses (~1 s), at
   which point it (re)builds the line.
 

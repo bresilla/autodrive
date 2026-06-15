@@ -28,7 +28,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import autosteer as a
+import autodrive as a
 
 JOB_IDS = [101, 102, 103, 104]   # the sequence of jobs to start
 HOLD_S = 3.0                     # how long to hold each job before the next

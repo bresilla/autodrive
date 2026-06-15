@@ -3,7 +3,7 @@
 A from-scratch guide to the GP (Oxbo / GPH) AutoDrive CAN protocol, building from
 "what is a CAN frame" up to the full message flow implemented in the numbered
 bring-up scripts here (`01_*.py` … `10_full_run.py`) and the shared library
-[`autosteer.py`](autosteer.py).
+[`autodrive.py`](autodrive.py).
 
 Source of truth: [`spec/GP_AutoDrive_CanMessageProposal_V10.pdf`](spec/GP_AutoDrive_CanMessageProposal_V10.pdf).
 This document is the prose explanation; the PDF is the authoritative byte tables.
@@ -11,7 +11,7 @@ This document is the prose explanation; the PDF is the authoritative byte tables
 > Status note: the field checklist [`spec/spec2.md`](spec2.md) (2 Jun 2026)
 > resolved several items the original proposal left uncertain — the source
 > address (we are **29 / `0x1D`**), the ADWPI offset (**−250000 cm**), and that
-> the **RunCommand is not yet wired** (the machine is driven by hand; AutoSteer
+> the **RunCommand is not yet wired** (the machine is driven by hand; AutoDrive
 > only steers). Two items remain open and are flagged inline as **⚠ verify with
 > vendor**: the `Current Direction` reverse value and the ADWPI byte-8 flag bits.
 
@@ -36,7 +36,7 @@ This document is the prose explanation; the PDF is the authoritative byte tables
 
 ## 1. The big picture
 
-The harvester already has a working autosteer stack:
+The harvester already has a working AutoDrive stack:
 
 ```
 TOPCON AGS-2 receiver  ──serial NMEA──►  AgJunction ECU-S1  ──CAN──►  MC42 Propel (steering valve)
@@ -279,10 +279,10 @@ Byte2 are 2-bit status fields** (see §5.1).
 | Byte | Bits | Field                         | Notes |
 |------|------|-------------------------------|-------|
 | 1    | 8-7  | GPS PPP available             | gate condition |
-| 1    | 6-5  | AutoSteer engaged             | feedback that steering actually took |
+| 1    | 6-5  | AutoDrive engaged             | feedback that steering actually took |
 | 1    | 4-3  | Header down                   | |
 | 1    | 2-1  | Current direction             | forward / reverse — ⚠ which value = reverse, verify |
-| 2    | 8-3  | AutoSteer interrupt / reject reason | 6-bit code, 0 = none |
+| 2    | 8-3  | AutoDrive interrupt / reject reason | 6-bit code, 0 = none |
 | 2    | 2-1  | AutoDrive allowed             | gate condition (field mode + operator option) |
 | 3-4  | —    | Perpendicular distance to line | i16, `1 cm/bit`, offset −1000 cm |
 | 5    | —    | Overlap setting               | `1 cm/bit`, offset −125 cm (set before job; fixed 18-25 cm) |
@@ -290,7 +290,7 @@ Byte2 are 2-bit status fields** (see §5.1).
 | 7    | —    | lhTipDistance                 | `1 cm/bit`, no offset |
 | 8    | —    | (continuation of byte7 field) | `1 cm/bit`, no offset |
 
-Decoder: `decode_dsstat`. We use PPP-available, AutoDrive-allowed, AutoSteer-engaged,
+Decoder: `decode_dsstat`. We use PPP-available, AutoDrive-allowed, AutoDrive-engaged,
 header-down, current-direction, and reject-reason. The header geometry fields
 (overlap, reel width, lhTipDistance) are informational for path placement and are not
 currently consumed by the bridge.
@@ -394,8 +394,8 @@ The choreography from the proposal's sequence table:
 ┌─ Run ────────────────────────────────────────────────────────────────────────┐
 │  AutoDrive TX: ADJOB (systemActive=TRUE + RunCommand=TRUE)                    │
 │  Operator drives forward 1-2 kph (RunCommand not wired yet, §9);             │
-│  AutoSteer then engages and steers                                            │
-│  Display  RX:  DSSTAT (AutoSteer engaged = true), VP1/VDS                     │
+│  AutoDrive then engages and steers                                            │
+│  Display  RX:  DSSTAT (AutoDrive engaged = true), VP1/VDS                     │
 └──────────────────────────────────────────────────────────────────────────────┘
                                    │  as machine advances
                                    ▼
@@ -510,9 +510,9 @@ How a run actually goes today:
 
 - The AgJunction cannot engage from a standstill, so make a **flying start**: park
   ~5 m before the first point, drive straight at it on the joystick, and engage
-  AutoSteer as you reach the point. **The first metre or two has no guidance.**
+  AutoDrive as you reach the point. **The first metre or two has no guidance.**
 - Drive **slowly, 1–2 kph** — earlier curve tests were rough; turning the steering
-  PID up may help. When AutoSteer actually engages, `DSSTAT` reports **AutoSteer
+  PID up may help. When AutoDrive actually engages, `DSSTAT` reports **AutoDrive
   engaged = true** (possibly a few seconds later). It's not guaranteed the
   AgJunction follows a curved line cleanly.
 - **PPP must be true RTK** (the RTK icon purple) — a FLOAT fix is *not* good enough.
@@ -522,7 +522,7 @@ How a run actually goes today:
 the same flying-start caveat applies: the machine may pass a few waypoints and be
 slightly off-line before re-engaging.
 
-**Errors.** If AutoSteer refuses to engage, the machine halts and DSSTAT byte2 carries
+**Errors.** If AutoDrive refuses to engage, the machine halts and DSSTAT byte2 carries
 an **interrupt/reject reason** code (manual override, bad GPS, cannot acquire line, …).
 The AutoDrive side can retry by resetting RunCommand. Conversely, the AutoDrive system
 reports its own faults via the **ADJOB error code** (byte2 bits 8-5); a non-zero error
@@ -534,7 +534,7 @@ code halts the machine.
 
 The bridge is route-source agnostic. All it needs is an ordered list of points in
 local ENU metres with two flags each — that's the `RoutePoint` type in
-[`autosteer.py`](autosteer.py):
+[`autodrive.py`](autodrive.py):
 
 ```python
 RoutePoint(x, y, is_headland=False, is_reverse=False)   # x=east m, y=north m, from datum
@@ -589,7 +589,7 @@ the step-by-step runbook):
       the right place (anchor-relative cm math is the usual culprit if it's offset or
       mirrored — check east/north sign and the 20-bit packing).
 - [ ] **Run.** Set RunCommand (`0x04`). It does **not** move the machine yet (§9) —
-      drive forward manually (1–2 kph, flying start) and confirm AutoSteer engaged in
+      drive forward manually (1–2 kph, flying start) and confirm AutoDrive engaged in
       DSSTAT. **Have a person at the e-stop.**
 - [ ] **Track.** Confirm ADJOB progress index advances and windows re-stream with the
       3-point overlap.
@@ -619,5 +619,5 @@ the step-by-step runbook):
 
 ---
 
-*Implementation: the numbered scripts + [`autosteer.py`](autosteer.py).
+*Implementation: the numbered scripts + [`autodrive.py`](autodrive.py).
 Authoritative byte tables: [`spec/GP_AutoDrive_CanMessageProposal_V10.pdf`](spec/GP_AutoDrive_CanMessageProposal_V10.pdf).*

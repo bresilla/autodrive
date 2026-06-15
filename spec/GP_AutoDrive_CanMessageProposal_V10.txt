@@ -1,4 +1,4 @@
-1. AutoSteer system overview
+1. AutoDrive system overview
 GPH currently has the following system (optionally) installed. The “Autonomous Driving Computer” would be fifth component, which basically takes
 over the Line Management partially from the Display.
 •
@@ -86,7 +86,7 @@ DSSTAT (GPS correction available)
 DSAP (Anchor point)
 
 VP1 & VDS (GPS coords / speed / compass)
-DSSTAT (Autosteer engaged y/n)
+DSSTAT (AutoDrive engaged y/n)
 
 3. GPS coordinates
 The display will constantly forward the (transformed) GPS coordinates, using these 2 (SAE standard) messages – also when the AutoDrive system is
@@ -184,7 +184,7 @@ o
 
 AgJunction will (re)smooth the line for its own usage, nonetheless it is recommended to ensure Spacing and Angle limits as described in chapter 5.2
 
-The AutoSteer system will try to put the header-center on top of the steerline. Be aware that for machines with an excentric header position, the
+The AutoDrive system will try to put the header-center on top of the steerline. Be aware that for machines with an excentric header position, the
 distancing between lines varies depending from which direction the machine is coming:
 
 Overlap, reel width (that is the actual picking reel inside (shaft-to-shaft), not the whole header) & lhTipDistance are broadcasted in the DSSTAT
@@ -205,7 +205,7 @@ shared.
 The AgJunction should(*) be able to follow a curved line, though it has certain requirements:
 
 Both the Display and AgJunction itself will smooth / rebuild the line, but it’s probably good if the AutoDrive ECU uses the same logic.
-* We noticed the machine having difficulties with following a curved line, eventually losing track and quitting autosteer as the AgJunction
+* We noticed the machine having difficulties with following a curved line, eventually losing track and quitting AutoDrive as the AgJunction
 missed too many waypoints. Possible causes could be:
 - Too much “zig-zagging” on a relative short distance (we never used very sharp turns)
 - Wheels not steering quick enough (aggressive) enough on the propel (we can tweak that)
@@ -232,14 +232,14 @@ So when switching on the contact or entering a field, it may take a while before
 be off the intended line. For a first try, it is recommended to put the machine right in front of the starting point. AgJunction can steer towards the line to
 some extend, but shouldn’t start too far away.
 Once the “RunCommand” turns on, the machine will drive forward (or in reverse if the next point says so) slowly (1 kph), as AgJunction cannot activate
-without driving first. After a short delay, the AutoSteer Engage request will be sent towards AgJunction. When the AutoSteer system is actually
-engaged, it will report back (see right message, “AutoSteer Engaged”):
+without driving first. After a short delay, the AutoDrive Engage request will be sent towards AgJunction. When the AutoDrive system is actually
+engaged, it will report back (see right message, “AutoDrive Engaged”):
 
 This means that:
 - The first meter(s), the machine has no waypoint yet, it will simply drive forward
 o This can be problematic if the machine was halted during a curve !
-- The feedback “AutoSteer Engaged = TRUE” status might be a few seconds after the RunCommand was given
-If the autosteer refuses to engage for whatever reason, the machine will halt and report an “AutoSteer interrupt/reject” code (which resembles a
+- The feedback “AutoDrive Engaged = TRUE” status might be a few seconds after the RunCommand was given
+If the AutoDrive refuses to engage for whatever reason, the machine will halt and report an “AutoDrive interrupt/reject” code (which resembles a
 certain reason such as manually overrided, bad GPS signal, cannot acquire line, et cetera). If this happens, the system can try again by resetting the
 RunCommand, and otherwise an operator is needed.
 During the ride, the AutoDrive system can also ask the machine to halt by turning off the RunCommand – for example if the machine needs to unload

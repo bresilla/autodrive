@@ -16,7 +16,7 @@ Loop (see PROTOCOL.md §7):
       → stream ADWPI windows, raise RunCommand, track progress via ADJOB
 
 ⚠️ On a real machine the RunCommand does NOT drive it yet (PROTOCOL.md §9) — you
-   drive forward on the joystick (1-2 kph, flying start) and AutoSteer only steers.
+   drive forward on the joystick (1-2 kph, flying start) and AutoDrive only steers.
    Area clear, e-stop in hand. On the bench the simulator drives for you.
 
 Run:
@@ -32,7 +32,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import autosteer as a
+import autodrive as a
 import routes
 
 
@@ -176,7 +176,7 @@ def main() -> None:
                 hl = "H" if route[current_index].is_headland else "-"
                 print(f"[{now:6.1f}s] active={'Y' if active else '-'} "
                       f"run={'Y' if (active and run_command) else '-'} "
-                      f"engaged={'Y' if status.autosteer_engaged else '-'} "
+                      f"engaged={'Y' if status.autodrive_engaged else '-'} "
                       f"progress {current_index}/{len(waypoints)} [{hl}] "
                       f"spd={status.speed_kph:4.1f}kph")
 

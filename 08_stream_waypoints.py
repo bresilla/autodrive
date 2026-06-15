@@ -27,7 +27,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import autosteer as a
+import autodrive as a
 import routes
 
 # Datum is taken from the loaded route's first vertex in main(); placeholder here.
