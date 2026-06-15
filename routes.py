@@ -99,17 +99,20 @@ def geojson_datum(path: str) -> tuple[float, float]:
     return lat, lon
 
 
-def geojson_route(path: str, spacing_m: float = WAYPOINT_SPACING_M
+def geojson_route(path: str, spacing_m: float = WAYPOINT_SPACING_M,
+                  datum_lat: float | None = None, datum_lon: float | None = None
                   ) -> tuple[list[a.RoutePoint], float, float]:
     """
     Load a GeoJSON LineString as a route. Returns (route, datum_lat, datum_lon).
 
-    The first vertex is the datum, so the route starts at ENU origin (same
-    convention as the synthetic routes). Vertices are converted to ENU metres,
+    By default the first vertex is the datum, so the route starts at ENU origin
+    (same convention as the synthetic routes). Pass datum_lat/datum_lon to use a
+    machine-provided anchor instead. Vertices are converted to ENU metres,
     resampled to `spacing_m`, and headland-flagged where the path turns.
     """
     coords = _load_linestring(path)
-    datum_lon, datum_lat = coords[0]
+    if datum_lat is None or datum_lon is None:
+        datum_lon, datum_lat = coords[0]
     enu = [a.wgs_to_enu_approx(lat, lon, datum_lat, datum_lon) for lon, lat in coords]
     resampled = _resample(enu, spacing_m)
     return _mark_headland(resampled, spacing_m), datum_lat, datum_lon

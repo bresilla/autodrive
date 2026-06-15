@@ -22,8 +22,10 @@
           matplotlib
           pandas
           ipython
+          psutil
           pytest
           requests
+          rerun-sdk
         ]
       );
     in

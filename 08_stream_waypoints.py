@@ -30,32 +30,34 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autodrive as a
 import routes
 
-# Datum is taken from the loaded route's first vertex in main(); placeholder here.
-DATUM_LAT, DATUM_LON = 0.0, 0.0
-
 TARGET_POINTS = 120                 # how many waypoints we want to stream
 MIN_SPACING_M = 0.3                 # AgJunction minimum point spacing (PROTOCOL.md §8.5)
 
 
-def load_line_with_points(target: int):
+def line_spacing_for_points(target: int):
     """Load line.geojson resampled to ~`target` points (spacing = length/(target-1)).
-    Returns (route, datum_lat, datum_lon, spacing_m)."""
+    Returns (route_path, point_count, spacing_m)."""
     path = routes.geojson_path("line")
     base, dlat, dlon = routes.geojson_route(path)
     length = sum(math.hypot(base[i + 1].x - base[i].x, base[i + 1].y - base[i].y)
                  for i in range(len(base) - 1))
     if length <= 0 or target < 2:
-        return base, dlat, dlon, routes.WAYPOINT_SPACING_M
+        return path, len(base), routes.WAYPOINT_SPACING_M
     spacing = length / (target - 1)
     route, dlat, dlon = routes.geojson_route(path, spacing_m=spacing)
-    return route, dlat, dlon, spacing
+    return path, len(route), spacing
 
 
-def build_waypoints(route, anchor_lat, anchor_lon):
-    anchor_e, anchor_n = a.wgs_to_enu_approx(anchor_lat, anchor_lon, DATUM_LAT, DATUM_LON)
+def load_line_from_anchor(path, spacing_m, anchor_lat, anchor_lon):
+    """Read line.geojson with the machine anchor as ENU origin."""
+    return routes.geojson_route(path, spacing_m=spacing_m,
+                                datum_lat=anchor_lat, datum_lon=anchor_lon)[0]
+
+
+def build_waypoints(route):
     return [a.Waypoint(index=i,
-                       east_cm=round((p.x - anchor_e) * 100.0),
-                       north_cm=round((p.y - anchor_n) * 100.0),
+                       east_cm=round(p.x * 100.0),
+                       north_cm=round(p.y * 100.0),
                        is_headland=p.is_headland, is_reverse=p.is_reverse)
             for i, p in enumerate(route)]
 
@@ -75,9 +77,8 @@ def stream_window(bus, status, waypoints, current_index, count=TARGET_POINTS):
 
 
 def main() -> None:
-    global DATUM_LAT, DATUM_LON
-    route, DATUM_LAT, DATUM_LON, spacing = load_line_with_points(TARGET_POINTS)
-    print(f"line route: {len(route)} points at {spacing:.3f} m spacing "
+    route_path, point_count, spacing = line_spacing_for_points(TARGET_POINTS)
+    print(f"line route: {point_count} points at {spacing:.3f} m spacing "
           f"(target {TARGET_POINTS})", file=sys.stderr)
     if spacing < MIN_SPACING_M:
         print(f"note: {spacing:.3f} m spacing is below the AgJunction {MIN_SPACING_M} m "
@@ -91,7 +92,7 @@ def main() -> None:
         frame = bus.recv(timeout=0.05)
         if frame is not None:
             a.process_frame(frame, status)
-        a.send(bus, a.PGN_ADJOB, a.encode_adjob(True, False, 0, len(route)))
+        a.send(bus, a.PGN_ADJOB, a.encode_adjob(True, False, 0, point_count))
 
     if status.anchor_lat is None:
         print("no anchor — cannot stream. Is the Display/simulator running, and "
@@ -99,9 +100,10 @@ def main() -> None:
         return
 
     print(f"anchored at {status.anchor_lat:.7f},{status.anchor_lon:.7f}; "
-          f"route has {len(route)} points\n")
+          f"using anchor as waypoint origin\n")
 
-    waypoints = build_waypoints(route, status.anchor_lat, status.anchor_lon)
+    route = load_line_from_anchor(route_path, spacing, status.anchor_lat, status.anchor_lon)
+    waypoints = build_waypoints(route)
     start, end, sent = stream_window(bus, status, waypoints, current_index=0)
 
     print(f"streamed first window: indices [{start}..{end - 1}], {sent} frames "
