@@ -39,6 +39,40 @@ Default if unset: `vcan0`.
 
 ---
 
+## REST API
+
+`api_server.py` passively listens to the CAN bus and exposes the latest decoded
+machine state as JSON. It does **not** activate AutoDrive or send run commands.
+
+```sh
+export CAN_BUS=can0
+./api_server.py
+```
+
+By default it binds to `0.0.0.0:8080`, so another computer on the same network can
+query it with the machine computer's IP address:
+
+```sh
+curl http://MACHINE_IP:8080/state
+curl http://MACHINE_IP:8080/position
+curl http://MACHINE_IP:8080/anchorpoint
+curl http://MACHINE_IP:8080/status
+curl http://MACHINE_IP:8080/health
+```
+
+Useful options:
+
+```sh
+./api_server.py --host 0.0.0.0 --port 8080 --can-bus can0
+./api_server.py --can-bus vcan0   # bench test with simulator.py
+```
+
+The `/state` endpoint returns position, anchor point, status bits, CAN bus name,
+frame count, last PGN, last receive age, and whether live CAN traffic is currently
+fresh.
+
+---
+
 ## Bench setup (rehearse with no machine)
 
 Do the whole sequence on a **virtual CAN** bus first — it behaves exactly like a
