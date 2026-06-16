@@ -2,17 +2,18 @@
 """
 Step 08 — stream a rolling window of waypoints (ADWPI).
 
-Goal: once anchored, send the route as ADWPI frames in one batch (TARGET_POINTS,
-currently 120) with 3-point overlap and 10 ms pacing.
+Goal: once anchored, send the route as ADWPI frames. The route is interpolated
+to at least one point per metre by default, then every point is streamed with
+10 ms pacing.
 
 What this step proves:
-  * batching: stream the first TARGET_POINTS, overlapping the previous batch by 3
-  * pacing: pause 10 ms after each frame (120 points ≈ 1.2 seconds)
+  * full route: stream all waypoints by default
+  * optional batching: use --batch-size to cap ADWPI frames per batch
+  * pacing: pause 10 ms after each frame
   * the "engage after ≥100 points streamed" rule lives here
 
-The route is the short line.geojson test line, resampled finely enough to yield
-TARGET_POINTS so the first batch hits that count. At 120 points on this line the
-spacing dips just under the AgJunction 0.3 m minimum — fine for drawing the line.
+The route is loaded from GeoJSON and resampled so long straight LineString
+segments get interpolated before ADWPI frames are sent.
 
 Run:
     ./08_stream_waypoints.py
@@ -31,13 +32,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autodrive as a
 import routes
 
-TARGET_POINTS = 120                 # how many waypoints we want to stream
+DEFAULT_MAX_SPACING_M = 1.0         # interpolate route points at least every metre
+DEFAULT_BATCH_SIZE = 0              # 0 = stream the whole route in one batch
 MIN_SPACING_M = 0.3                 # AgJunction minimum point spacing (PROTOCOL.md §8.5)
 FIELD_MARGIN_M = 15.0
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Request anchor, then stream the first ADWPI waypoint window.")
+    parser = argparse.ArgumentParser(description="Request anchor, then stream all ADWPI waypoints.")
     parser.add_argument(
         "--route",
         choices=sorted(routes.ROUTES),
@@ -61,6 +63,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="do not require the machine position to be inside the route field",
     )
+    parser.add_argument(
+        "--max-spacing",
+        type=float,
+        default=DEFAULT_MAX_SPACING_M,
+        help=f"maximum route spacing in metres after interpolation (default: {DEFAULT_MAX_SPACING_M})",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="maximum ADWPI frames per batch, including overlap; 0 means all points (default: 0)",
+    )
     return parser.parse_args()
 
 
@@ -71,18 +85,18 @@ def inside_field(status, field, datum_lat, datum_lon) -> bool:
     return a.point_inside_polygon(x, y, field)
 
 
-def line_spacing_for_points(route_name: str, target: int):
-    """Load a GeoJSON route resampled to ~`target` points (spacing = length/(target-1)).
-    Returns (route_path, point_count, spacing_m)."""
+def route_for_max_spacing(route_name: str, max_spacing_m: float):
+    """Load a GeoJSON route resampled so adjacent points are at most max_spacing_m."""
     path = routes.geojson_path(route_name)
-    base, dlat, dlon = routes.geojson_route(path)
-    length = sum(math.hypot(base[i + 1].x - base[i].x, base[i + 1].y - base[i].y)
-                 for i in range(len(base) - 1))
-    if length <= 0 or target < 2:
-        return path, len(base), routes.WAYPOINT_SPACING_M
-    spacing = length / (target - 1)
-    route, dlat, dlon = routes.geojson_route(path, spacing_m=spacing)
-    return path, len(route), spacing
+    route, dlat, dlon = routes.geojson_route(path, spacing_m=max_spacing_m)
+    return path, route, dlat, dlon
+
+
+def max_route_spacing(route) -> float:
+    if len(route) < 2:
+        return 0.0
+    return max(math.hypot(p1.x - p0.x, p1.y - p0.y)
+               for p0, p1 in zip(route, route[1:]))
 
 
 def load_line_from_anchor(path, spacing_m, anchor_lat, anchor_lon):
@@ -99,10 +113,10 @@ def build_waypoints(route):
             for i, p in enumerate(route)]
 
 
-def stream_window(bus, status, waypoints, current_index, count=TARGET_POINTS):
-    """Send waypoints[current-overlap : current+count], 10 ms apart."""
+def stream_window(bus, status, waypoints, current_index, count):
+    """Send one batch, including overlap, capped to count ADWPI frames."""
     start = max(0, current_index - a.WINDOW_OVERLAP_POINTS)
-    end = min(len(waypoints), current_index + count)
+    end = min(len(waypoints), start + count)
     sent = 0
     for wp in waypoints[start:end]:
         a.drain_rx(bus, status, max_frames=5)
@@ -113,16 +127,45 @@ def stream_window(bus, status, waypoints, current_index, count=TARGET_POINTS):
     return start, end, sent
 
 
+def stream_all_waypoints(bus, status, waypoints, batch_size: int):
+    """Stream every waypoint, resending a 3-point overlap between batches."""
+    if batch_size == 0:
+        batch_size = len(waypoints)
+    current_index = 0
+    batches = []
+    total_frames = 0
+    while current_index < len(waypoints):
+        start, end, sent = stream_window(bus, status, waypoints, current_index, batch_size)
+        batches.append((start, end, sent))
+        total_frames += sent
+        if end >= len(waypoints):
+            break
+        current_index = end
+    return batches, total_frames
+
+
 def main() -> None:
     args = parse_args()
-    route_path, point_count, spacing = line_spacing_for_points(args.route, TARGET_POINTS)
-    gate_route, datum_lat, datum_lon = routes.geojson_route(route_path, spacing_m=spacing)
+    if args.max_spacing <= 0:
+        raise SystemExit("--max-spacing must be greater than zero")
+    if args.batch_size < 0:
+        raise SystemExit("--batch-size must be zero or greater")
+
+    route_path, gate_route, datum_lat, datum_lon = route_for_max_spacing(args.route, args.max_spacing)
+    point_count = len(gate_route)
+    actual_max_spacing = max_route_spacing(gate_route)
+    if point_count > a.PROTOCOL_U16_MAX:
+        raise SystemExit(f"{args.route} has {point_count} points after interpolation; "
+                         f"protocol max is {a.PROTOCOL_U16_MAX}")
+
     field = routes.bounding_field(gate_route, FIELD_MARGIN_M)
     job_id = args.job_id if args.job_id is not None else int(time.time()) % (a.PROTOCOL_U16_MAX + 1)
-    print(f"{args.route} route: {point_count} points at {spacing:.3f} m spacing "
-          f"(target {TARGET_POINTS}), job_id={job_id}", file=sys.stderr)
-    if spacing < MIN_SPACING_M:
-        print(f"note: {spacing:.3f} m spacing is below the AgJunction {MIN_SPACING_M} m "
+    batch_label = "all" if args.batch_size == 0 else str(args.batch_size)
+    print(f"{args.route} route: {point_count} points, max spacing {actual_max_spacing:.3f} m "
+          f"(limit {args.max_spacing:.3f} m), batch_size={batch_label}, job_id={job_id}",
+          file=sys.stderr)
+    if actual_max_spacing < MIN_SPACING_M:
+        print(f"note: {actual_max_spacing:.3f} m spacing is below the AgJunction {MIN_SPACING_M} m "
               f"minimum (fine for drawing the line; tighten the route to fix).", file=sys.stderr)
     bus = a.make_bus()
     status = a.MachineStatus()
@@ -171,18 +214,20 @@ def main() -> None:
     print(f"anchored at {status.anchor_lat:.7f},{status.anchor_lon:.7f}; "
           f"using anchor as waypoint origin\n")
 
-    route = load_line_from_anchor(route_path, spacing, status.anchor_lat, status.anchor_lon)
+    route = load_line_from_anchor(route_path, args.max_spacing, status.anchor_lat, status.anchor_lon)
     waypoints = build_waypoints(route)
-    start, end, sent = stream_window(bus, status, waypoints, current_index=0)
+    batches, total_frames = stream_all_waypoints(bus, status, waypoints, args.batch_size)
 
-    print(f"streamed first window: indices [{start}..{end - 1}], {sent} frames "
-          f"(~{sent * a.SEND_INTERVAL_S:.1f}s of bus time)")
-    print("first 3 points already passed are re-sent as overlap on the next window.")
-    if sent >= a.FUTURE_POINT_COUNT:
-        print(f"\n{sent} points streamed (≥ {a.FUTURE_POINT_COUNT}) → RunCommand is now "
+    for i, (start, end, sent) in enumerate(batches, start=1):
+        print(f"batch {i}: streamed indices [{start}..{end - 1}], {sent} frames")
+    print(f"\nstreamed all {len(waypoints)} waypoints in {len(batches)} batches, "
+          f"{total_frames} ADWPI frames including overlap "
+          f"(~{total_frames * a.SEND_INTERVAL_S:.1f}s of bus time)")
+    if total_frames >= a.FUTURE_POINT_COUNT:
+        print(f"{total_frames} frames streamed (≥ {a.FUTURE_POINT_COUNT}) → RunCommand is now "
               f"allowed (step 09).")
     else:
-        print(f"\n{sent} < {a.FUTURE_POINT_COUNT} points streamed → RunCommand NOT yet "
+        print(f"{total_frames} < {a.FUTURE_POINT_COUNT} frames streamed → RunCommand NOT yet "
               f"allowed (line too short).")
 
 

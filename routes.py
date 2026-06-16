@@ -153,7 +153,7 @@ def _resample(vertices: list[tuple[float, float]], spacing_m: float
     for (x0, y0), (x1, y1) in zip(vertices, vertices[1:]):
         cum.append(cum[-1] + math.hypot(x1 - x0, y1 - y0))
     total = cum[-1]
-    n = max(1, round(total / spacing_m))
+    n = max(1, math.ceil(total / spacing_m))
     out, seg = [], 0
     for k in range(n + 1):
         target = min(total, k * total / n)
