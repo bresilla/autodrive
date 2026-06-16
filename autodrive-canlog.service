@@ -4,7 +4,6 @@ After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/c/autodrive
 ExecStartPre=/usr/bin/mkdir -p /home/oxbo/data/can
 ExecStart=%h/c/autodrive/hourly_can_logger.py /home/oxbo/data/can --can-bus can0 --flush-every 1
 Restart=always
