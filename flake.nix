@@ -17,6 +17,7 @@
       python = pkgs.python313.withPackages (
         ps: with ps; [
           numpy
+          python-can
           pillow
           scipy
           matplotlib
