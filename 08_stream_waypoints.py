@@ -20,6 +20,7 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import math
 import os
 import sys
@@ -33,6 +34,28 @@ import routes
 TARGET_POINTS = 120                 # how many waypoints we want to stream
 MIN_SPACING_M = 0.3                 # AgJunction minimum point spacing (PROTOCOL.md §8.5)
 FIELD_MARGIN_M = 15.0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Request anchor, then stream the first ADWPI waypoint window.")
+    parser.add_argument(
+        "--job-id",
+        type=int,
+        default=None,
+        help="ADJOB id to send; default is a fresh time-based u16 id",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="seconds to wait for a valid DSAP anchor before giving up",
+    )
+    parser.add_argument(
+        "--no-inside-gate",
+        action="store_true",
+        help="do not require the machine position to be inside the route field",
+    )
+    return parser.parse_args()
 
 
 def inside_field(status, field, datum_lat, datum_lon) -> bool:
@@ -85,10 +108,11 @@ def stream_window(bus, status, waypoints, current_index, count=TARGET_POINTS):
 
 
 def main() -> None:
+    args = parse_args()
     route_path, point_count, spacing = line_spacing_for_points(TARGET_POINTS)
     gate_route, datum_lat, datum_lon = routes.geojson_route(route_path, spacing_m=spacing)
     field = routes.bounding_field(gate_route, FIELD_MARGIN_M)
-    job_id = int(time.time()) % (a.PROTOCOL_U16_MAX + 1)
+    job_id = args.job_id if args.job_id is not None else int(time.time()) % (a.PROTOCOL_U16_MAX + 1)
     print(f"line route: {point_count} points at {spacing:.3f} m spacing "
           f"(target {TARGET_POINTS}), job_id={job_id}", file=sys.stderr)
     if spacing < MIN_SPACING_M:
@@ -100,16 +124,21 @@ def main() -> None:
     # Activate so the Display gives us an anchor.
     t0 = time.monotonic()
     last_adjob = -999.0
-    while status.anchor_lat is None and time.monotonic() - t0 < 10.0:
+    active_sent = False
+    while not (active_sent and status.anchor_lat is not None) and time.monotonic() - t0 < args.timeout:
         frame = bus.recv(timeout=0.05)
         if frame is not None:
             a.process_frame(frame, status)
         now = time.monotonic() - t0
         active = (status.gps_ppp_available
                   and status.autodrive_allowed
-                  and inside_field(status, field, datum_lat, datum_lon))
+                  and (args.no_inside_gate or inside_field(status, field, datum_lat, datum_lon)))
         if now - last_adjob >= a.ADJOB_PERIOD_S:
             last_adjob = now
+            if active and not active_sent:
+                active_sent = True
+                status.anchor_lat = None
+                status.anchor_lon = None
             a.send(bus, a.PGN_ADJOB, a.encode_adjob(
                 system_active=active,
                 run_command=False,
@@ -118,7 +147,15 @@ def main() -> None:
                 job_id=job_id,
             ))
             print(f"[{now:4.1f}s] ADJOB systemActive={'Y' if active else '-'} "
-                  f"job_id={job_id} total_points={point_count}")
+                  f"job_id={job_id} total_points={point_count} "
+                  f"(ppp={'Y' if status.gps_ppp_available else '-'} "
+                  f"allowed={'Y' if status.autodrive_allowed else '-'} "
+                  f"inside={'skip' if args.no_inside_gate else ('Y' if inside_field(status, field, datum_lat, datum_lon) else '-')})")
+
+    if not active_sent:
+        print("no active job request sent — cannot stream. Check PPP, AutoDrive allowed, "
+              "and inside gate; use --no-inside-gate only for field diagnostics.")
+        return
 
     if status.anchor_lat is None:
         print("no anchor — cannot stream. Is the Display/simulator running, and "
