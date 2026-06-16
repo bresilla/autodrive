@@ -1,0 +1,13 @@
+[Unit]
+Description=AutoDrive REST API server
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/c/autodrive
+ExecStart=%h/c/autodrive/api_server.py --host 0.0.0.0 --port 8080 --can-bus can0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
