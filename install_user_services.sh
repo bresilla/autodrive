@@ -29,7 +29,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=${REPO_DIR}/api_server.py --host 0.0.0.0 --port 8080 --can-bus can0
+ExecStart=${REPO_DIR}/api_server.py --host :: --port 8080 --can-bus can0
 Restart=always
 RestartSec=2
 
@@ -45,7 +45,7 @@ systemctl --user restart autodrive-api.service
 
 echo "Installed and started:"
 echo "  autodrive-canlog.service -> /home/oxbo/data/can"
-echo "  autodrive-api.service    -> http://0.0.0.0:8080"
+echo "  autodrive-api.service    -> http://0.0.0.0:8080 and http://[::]:8080"
 echo
 echo "Check status with:"
 echo "  systemctl --user status autodrive-canlog.service"

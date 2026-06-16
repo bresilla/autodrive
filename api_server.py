@@ -8,10 +8,11 @@ start/stop AutoDrive.
 
 Run:
     ./api_server.py
-    ./api_server.py --host 0.0.0.0 --port 8080 --can-bus can0
+    ./api_server.py --host :: --port 8080 --can-bus can0
 
 From another computer on the same network:
     curl http://MACHINE_IP:8080/state
+    curl 'http://[MACHINE_IPV6]:8080/state'
     curl http://MACHINE_IP:8080/position
     curl http://MACHINE_IP:8080/anchorpoint
     curl http://MACHINE_IP:8080/status
@@ -23,6 +24,7 @@ import argparse
 import copy
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -35,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autodrive as a
 
 
-DEFAULT_HOST = "0.0.0.0"
+DEFAULT_HOST = "::"
 DEFAULT_PORT = 8080
 STALE_AFTER_S = 2.0
 ENDPOINTS = ["/", "/state", "/position", "/anchorpoint", "/status", "/health"]
@@ -194,18 +196,46 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def display_base_url(host: str, port: int) -> str:
-    display_host = "localhost" if host in ("0.0.0.0", "::") else host
-    return f"http://{display_host}:{port}"
+class DualStackThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError as exc:
+            print(f"warning: could not disable IPV6_V6ONLY: {exc}", file=sys.stderr)
+        super().server_bind()
+
+
+def is_ipv6_host(host: str) -> bool:
+    return ":" in host
+
+
+def create_http_server(host: str, port: int, handler) -> ThreadingHTTPServer:
+    if is_ipv6_host(host):
+        return DualStackThreadingHTTPServer((host, port, 0, 0), handler)
+    return ThreadingHTTPServer((host, port), handler)
+
+
+def display_base_urls(host: str, port: int) -> list[str]:
+    if host == "::":
+        return [f"http://localhost:{port}", f"http://[::1]:{port}"]
+    if host == "0.0.0.0":
+        return [f"http://localhost:{port}"]
+    if is_ipv6_host(host):
+        return [f"http://[{host}]:{port}"]
+    return [f"http://{host}:{port}"]
 
 
 def print_startup_banner(host: str, port: int, can_bus: str) -> None:
-    base_url = display_base_url(host, port)
     print(f"AutoDrive REST API listening on http://{host}:{port}", file=sys.stderr)
+    if host == "::":
+        print("IPv6 dual-stack requested: IPv6 plus IPv4-mapped connections.", file=sys.stderr)
     print(f"Reading CAN bus {can_bus!r}. Press Ctrl-C to stop.", file=sys.stderr)
     print("Available REST endpoints:", file=sys.stderr)
-    for endpoint in ENDPOINTS:
-        print(f"  {base_url}{endpoint}", file=sys.stderr)
+    for base_url in display_base_urls(host, port):
+        for endpoint in ENDPOINTS:
+            print(f"  {base_url}{endpoint}", file=sys.stderr)
 
 
 def main() -> None:
@@ -215,7 +245,7 @@ def main() -> None:
     reader = threading.Thread(target=can_reader, args=(shared, stop_event), daemon=True)
     reader.start()
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(shared))
+    server = create_http_server(args.host, args.port, make_handler(shared))
     print_startup_banner(args.host, args.port, args.can_bus)
 
     try:
