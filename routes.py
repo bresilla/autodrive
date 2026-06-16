@@ -120,10 +120,27 @@ def geojson_route(path: str, spacing_m: float = WAYPOINT_SPACING_M,
 
 def _load_linestring(path: str) -> list[tuple[float, float]]:
     """Pull the first LineString's [lon, lat] vertices out of a GeoJSON file."""
-    gj = json.load(open(path))
-    geom = gj["features"][0]["geometry"]
-    if geom["type"] != "LineString":
-        raise ValueError(f"{path}: expected a LineString, got {geom['type']!r}")
+    with open(path) as f:
+        gj = json.load(f)
+
+    if gj.get("type") == "FeatureCollection":
+        geometries = [
+            feature.get("geometry") or {}
+            for feature in gj.get("features", [])
+        ]
+        for geom in geometries:
+            if geom.get("type") == "LineString":
+                break
+        else:
+            types = ", ".join(repr(g.get("type")) for g in geometries) or "no features"
+            raise ValueError(f"{path}: expected a LineString feature, got {types}")
+    elif gj.get("type") == "Feature":
+        geom = gj.get("geometry") or {}
+    else:
+        geom = gj
+
+    if geom.get("type") != "LineString":
+        raise ValueError(f"{path}: expected a LineString, got {geom.get('type')!r}")
     return [(float(lon), float(lat)) for lon, lat in geom["coordinates"]]
 
 
