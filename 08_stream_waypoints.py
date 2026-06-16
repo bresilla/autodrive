@@ -39,6 +39,12 @@ FIELD_MARGIN_M = 15.0
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Request anchor, then stream the first ADWPI waypoint window.")
     parser.add_argument(
+        "--route",
+        choices=sorted(routes.ROUTES),
+        default="line",
+        help="route to stream",
+    )
+    parser.add_argument(
         "--job-id",
         type=int,
         default=None,
@@ -65,10 +71,10 @@ def inside_field(status, field, datum_lat, datum_lon) -> bool:
     return a.point_inside_polygon(x, y, field)
 
 
-def line_spacing_for_points(target: int):
-    """Load line.geojson resampled to ~`target` points (spacing = length/(target-1)).
+def line_spacing_for_points(route_name: str, target: int):
+    """Load a GeoJSON route resampled to ~`target` points (spacing = length/(target-1)).
     Returns (route_path, point_count, spacing_m)."""
-    path = routes.geojson_path("line")
+    path = routes.geojson_path(route_name)
     base, dlat, dlon = routes.geojson_route(path)
     length = sum(math.hypot(base[i + 1].x - base[i].x, base[i + 1].y - base[i].y)
                  for i in range(len(base) - 1))
@@ -109,11 +115,11 @@ def stream_window(bus, status, waypoints, current_index, count=TARGET_POINTS):
 
 def main() -> None:
     args = parse_args()
-    route_path, point_count, spacing = line_spacing_for_points(TARGET_POINTS)
+    route_path, point_count, spacing = line_spacing_for_points(args.route, TARGET_POINTS)
     gate_route, datum_lat, datum_lon = routes.geojson_route(route_path, spacing_m=spacing)
     field = routes.bounding_field(gate_route, FIELD_MARGIN_M)
     job_id = args.job_id if args.job_id is not None else int(time.time()) % (a.PROTOCOL_U16_MAX + 1)
-    print(f"line route: {point_count} points at {spacing:.3f} m spacing "
+    print(f"{args.route} route: {point_count} points at {spacing:.3f} m spacing "
           f"(target {TARGET_POINTS}), job_id={job_id}", file=sys.stderr)
     if spacing < MIN_SPACING_M:
         print(f"note: {spacing:.3f} m spacing is below the AgJunction {MIN_SPACING_M} m "
