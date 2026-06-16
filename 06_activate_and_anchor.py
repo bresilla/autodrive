@@ -70,6 +70,11 @@ def parse_args() -> argparse.Namespace:
         default=15.0,
         help="metres around the route used for the inside-field gate",
     )
+    parser.add_argument(
+        "--no-inside-gate",
+        action="store_true",
+        help="do not require the machine position to be inside the route field",
+    )
     return parser.parse_args()
 
 
@@ -80,10 +85,11 @@ def inside_field(status: a.MachineStatus, field: list[tuple[float, float]]) -> b
     return a.point_inside_polygon(x, y, field)
 
 
-def ready_to_activate(status: a.MachineStatus, field: list[tuple[float, float]]) -> bool:
+def ready_to_activate(args: argparse.Namespace, status: a.MachineStatus,
+                      field: list[tuple[float, float]]) -> bool:
     return (status.gps_ppp_available
             and status.autodrive_allowed
-            and inside_field(status, field)
+            and (args.no_inside_gate or inside_field(status, field))
             and HAVE_WAYPOINTS)
 
 
@@ -117,7 +123,7 @@ def main() -> None:
             if pgn == a.PGN_DSSTAT:
                 last_dsstat = frame.data
 
-        active = ready_to_activate(status, field)
+        active = ready_to_activate(args, status, field)
 
         if now - last_adjob >= a.ADJOB_PERIOD_S:
             last_adjob = now
@@ -128,7 +134,8 @@ def main() -> None:
             print(f"[{now:5.1f}s] ADJOB systemActive={'Y' if active else '-'} "
                   f"run=- job_id={job_id} total_points={total_points} "
                   f"(ppp={yn(status.gps_ppp_available)} allowed={yn(status.autodrive_allowed)} "
-                  f"inside={yn(inside_field(status, field))} dsstat={hex_bytes(last_dsstat)})")
+                  f"inside={yn(inside_field(status, field)) if not args.no_inside_gate else 'skip'} "
+                  f"dsstat={hex_bytes(last_dsstat)})")
             if active and not announced_request:
                 announced_request = True
                 print("    job request sent; waiting for valid DSAP anchor")
