@@ -47,6 +47,7 @@ PGN_ADWPI = 0xFFCD
 # confirmed by spec/spec2.md — the spec sheet's earlier -25000 was an error.
 ADWPI_COORD_OFFSET_CM = -250_000
 ADWPI_COORD_RAW_MAX = (1 << 20) - 1
+LATLON_ZERO_RAW = 2_100_000_000
 
 # ADWPI byte-8 flags. 2-bit J1939 fields, "on" = 01. Editable — bit positions
 # were among the questioned items in the proposal.
@@ -174,8 +175,13 @@ def decode_dsap(data: bytes, status: MachineStatus) -> None:
         return
     lat_raw = struct.unpack_from("<I", data, 0)[0]
     lon_raw = struct.unpack_from("<I", data, 4)[0]
-    status.anchor_lat = decode_latlon_u32(lat_raw)
-    status.anchor_lon = decode_latlon_u32(lon_raw)
+    if (unavailable_u32(lat_raw) or unavailable_u32(lon_raw)
+            or (lat_raw == LATLON_ZERO_RAW and lon_raw == LATLON_ZERO_RAW)):
+        status.anchor_lat = None
+        status.anchor_lon = None
+    else:
+        status.anchor_lat = decode_latlon_u32(lat_raw)
+        status.anchor_lon = decode_latlon_u32(lon_raw)
     status.last_rx_s = time.monotonic()
 
 

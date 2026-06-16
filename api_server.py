@@ -38,6 +38,7 @@ import autodrive as a
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
 STALE_AFTER_S = 2.0
+ENDPOINTS = ["/", "/state", "/position", "/anchorpoint", "/status", "/health"]
 
 
 def iso_now() -> str:
@@ -193,6 +194,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def display_base_url(host: str, port: int) -> str:
+    display_host = "localhost" if host in ("0.0.0.0", "::") else host
+    return f"http://{display_host}:{port}"
+
+
+def print_startup_banner(host: str, port: int, can_bus: str) -> None:
+    base_url = display_base_url(host, port)
+    print(f"AutoDrive REST API listening on http://{host}:{port}", file=sys.stderr)
+    print(f"Reading CAN bus {can_bus!r}. Press Ctrl-C to stop.", file=sys.stderr)
+    print("Available REST endpoints:", file=sys.stderr)
+    for endpoint in ENDPOINTS:
+        print(f"  {base_url}{endpoint}", file=sys.stderr)
+
+
 def main() -> None:
     args = parse_args()
     shared = SharedState(args.can_bus)
@@ -201,8 +216,7 @@ def main() -> None:
     reader.start()
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(shared))
-    print(f"AutoDrive REST API listening on http://{args.host}:{args.port}", file=sys.stderr)
-    print(f"Reading CAN bus {args.can_bus!r}. Press Ctrl-C to stop.", file=sys.stderr)
+    print_startup_banner(args.host, args.port, args.can_bus)
 
     try:
         server.serve_forever()

@@ -71,6 +71,20 @@ The `/state` endpoint returns position, anchor point, status bits, CAN bus name,
 frame count, last PGN, last receive age, and whether live CAN traffic is currently
 fresh.
 
+To visualize the REST API feed in Rerun:
+
+```sh
+./rerun_consumer.py
+./rerun_consumer.py --api http://MACHINE_IP:8080/state
+./rerun_consumer.py --save autodrive.rrd --no-spawn
+```
+
+The Rerun consumer logs:
+
+- `autodrive/position` — current machine position point
+- `autodrive/anchorpoint` — current DSAP anchor point
+- `autodrive/machine_line` — heading line starting at the machine position
+
 ---
 
 ## Bench setup (rehearse with no machine)

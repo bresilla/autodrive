@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import struct
 import sys
 import time
 
@@ -80,8 +81,12 @@ def main() -> None:
             continue
 
         print(a.format_frame("RX", frame))
+        lat_raw = struct.unpack_from("<I", frame.data, 0)[0]
+        lon_raw = struct.unpack_from("<I", frame.data, 4)[0]
+        print(f"raw_anchor_lat=0x{lat_raw:08X} decoded={a.decode_latlon_u32(lat_raw)}")
+        print(f"raw_anchor_lon=0x{lon_raw:08X} decoded={a.decode_latlon_u32(lon_raw)}")
         if status.anchor_lat is None or status.anchor_lon is None:
-            print("DSAP received, but anchor lat/lon decoded as unavailable")
+            print("DSAP received, but anchor lat/lon is not a valid field anchor yet")
             return
 
         print(f"anchor_lat={status.anchor_lat:.7f}")

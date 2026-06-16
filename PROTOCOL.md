@@ -302,8 +302,11 @@ currently consumed by the bridge.
 | 1-4   | Anchor latitude  | u32, `1e-7 deg/bit`, offset −210 |
 | 5-8   | Anchor longitude | u32, `1e-7 deg/bit`, offset −210 |
 
-`0xFFFFFFFF` while the system is inactive. The arrival of a valid anchor is the
-trigger to (re)compute the local-frame waypoint table. Decoder: `decode_dsap`.
+The proposal says `0xFFFFFFFF` while the system is inactive. On the real machine
+we have also observed DSAP as encoded `0.0,0.0` (`00 75 2B 7D 00 75 2B 7D`) before
+a usable field anchor exists. Treat both forms as "no valid anchor yet". The
+arrival of a valid anchor is the trigger to (re)compute the local-frame waypoint
+table. Decoder: `decode_dsap`.
 
 ### 6.5 ADJOB — AutoDrive Job  (`0xFFCC`, **TX**)
 

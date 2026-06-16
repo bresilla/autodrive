@@ -32,7 +32,7 @@ PGN_NAMES = {
     a.PGN_VP1: "VP1   (GPS position)",
     a.PGN_VDS: "VDS   (heading/speed)",
     a.PGN_DSSTAT: "DSSTAT(status)",
-    a.PGN_DSAP: "DSAP  (anchor)",
+    a.PGN_DSAP: "DSAP  (anchor frame)",
     a.PGN_ADJOB: "ADJOB (job state)",
     a.PGN_ADWPI: "ADWPI (waypoint)",
 }
@@ -50,6 +50,9 @@ def main() -> None:
             continue
         pgn = a.pgn_from_id(frame.arbitration_id)
         name = PGN_NAMES.get(pgn, f"unknown 0x{pgn:04X}")
+        zero_anchor = a.LATLON_ZERO_RAW.to_bytes(4, "little") * 2
+        if pgn == a.PGN_DSAP and frame.data == zero_anchor:
+            name = "DSAP  (zero/no valid anchor yet)"
         counts[pgn] = counts.get(pgn, 0) + 1
         if counts[pgn] <= 2:   # show the first couple of each, then just tally
             print(a.format_frame("RX", frame), "←", name)
