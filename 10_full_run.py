@@ -124,6 +124,7 @@ def main() -> None:
     global DATUM_LAT, DATUM_LON
     route, DATUM_LAT, DATUM_LON = routes.ROUTES[ROUTE]()
     field = routes.bounding_field(route, FIELD_MARGIN_M)
+    job_id = int(time.time()) % (a.PROTOCOL_U16_MAX + 1)
 
     bus = a.make_bus()
     status = a.MachineStatus()
@@ -135,7 +136,7 @@ def main() -> None:
     t0 = time.monotonic()
     last_adjob = last_window = -999.0
 
-    print(f"full run: route={ROUTE!r} ({len(route)} pts) on {a.CAN_BUS}", file=sys.stderr)
+    print(f"full run: route={ROUTE!r} ({len(route)} pts) job_id={job_id} on {a.CAN_BUS}", file=sys.stderr)
 
     while LOOP_TIMEOUT_S is None or time.monotonic() - t0 < LOOP_TIMEOUT_S:
         now = time.monotonic() - t0
@@ -171,7 +172,8 @@ def main() -> None:
                 system_active=active,
                 run_command=active and run_command,
                 current_index=current_index,
-                total_points=len(waypoints) if waypoints else len(route)))
+                total_points=len(waypoints) if waypoints else len(route),
+                job_id=job_id))
             if waypoints:
                 hl = "H" if route[current_index].is_headland else "-"
                 print(f"[{now:6.1f}s] active={'Y' if active else '-'} "

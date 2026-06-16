@@ -71,19 +71,31 @@ The `/state` endpoint returns position, anchor point, status bits, CAN bus name,
 frame count, last PGN, last receive age, and whether live CAN traffic is currently
 fresh.
 
+To log all CAN traffic continuously to hourly files:
+
+```sh
+./hourly_can_logger.py /var/log/autodrive-can --can-bus can0
+```
+
+It writes candump-style files named like `can0_20260616_1400.log`, rotating at the
+top of each hour.
+
 To visualize the REST API feed in Rerun:
 
 ```sh
 ./rerun_consumer.py
-./rerun_consumer.py --api http://MACHINE_IP:8080/state
+./rerun_consumer.py --api http://172.30.0.137:8080/state
+./rerun_consumer.py --trail-seconds 1800
 ./rerun_consumer.py --save autodrive.rrd --no-spawn
 ```
 
-The Rerun consumer logs:
+The Rerun consumer uses a Rerun `MapView` and static map logs for the live
+entities:
 
-- `autodrive/position` — current machine position point
-- `autodrive/anchorpoint` — current DSAP anchor point
-- `autodrive/machine_line` — heading line starting at the machine position
+- `autodrive/position` — current machine position as a geospatial point
+- `autodrive/anchorpoint` — current DSAP anchor as a geospatial point
+- `autodrive/machine_line` — geospatial heading line starting at the machine position
+- `autodrive/trail` — recent machine path, capped by `--trail-seconds` (default 1800 / 30 min)
 
 ---
 
@@ -235,13 +247,25 @@ and **AutoDrive allowed** (the latter is operator-enabled on the display).
 ### Step 6 — Can we start a job and get an anchor?
 
 `06_activate_and_anchor.py` runs the activation gate (PPP + AutoDrive allowed +
-inside field + route loaded), sends **systemActive=true** (RunCommand still OFF),
-and waits for the Display to broadcast a **DSAP anchor**.
+inside field + route loaded), sends **ADJOB systemActive=true** with a fresh job
+ID (RunCommand still OFF), and waits for the Display to broadcast a **DSAP
+anchor**.
 
-> Set `FIELD_ENU` / `DATUM_*` to your real field and place the machine inside it.
+> Set `line.geojson` / `u_field.geojson` to your real field path and place the
+> machine inside the route's field box. For diagnostics only, `print_dsap_anchor.py`
+> has `--no-inside-gate`; normal job requests should keep the inside-field gate on.
 
 ```sh
 ./06_activate_and_anchor.py
+```
+
+For a direct anchor-only check, `print_dsap_anchor.py` now also sends ADJOB first
+by default:
+
+```sh
+./print_dsap_anchor.py
+./print_dsap_anchor.py --route uturn
+./print_dsap_anchor.py --passive   # listen only, do not request a job
 ```
 
 - ✅ **PASS:** `✓ anchor received` near the field. Machine has **not moved**.

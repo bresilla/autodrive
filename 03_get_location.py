@@ -36,13 +36,16 @@ def main() -> None:
 
     t0 = time.monotonic()
     last_print = 0.0
+    last_vds: bytes | None = None
     while True:
         now = time.monotonic() - t0
         if now >= LISTEN_SECONDS:
             break
         frame = bus.recv(timeout=0.05)
         if frame is not None:
-            a.process_frame(frame, status)
+            pgn = a.process_frame(frame, status)
+            if pgn == a.PGN_VDS:
+                last_vds = frame.data
 
         if now - last_print >= 0.5:
             last_print = now
@@ -51,7 +54,14 @@ def main() -> None:
             else:
                 head = "?" if status.heading_deg is None else f"{status.heading_deg:6.1f}°"
                 print(f"[{now:4.1f}s] lat={status.gps_lat:.7f} lon={status.gps_lon:.7f} "
-                      f"hdg={head} spd={status.speed_kph:4.1f} kph")
+                      f"hdg={head} spd={status.speed_kph:4.1f} kph "
+                      f"vds={hex_bytes(last_vds)}")
+
+
+def hex_bytes(data: bytes | None) -> str:
+    if data is None:
+        return "none"
+    return " ".join(f"{b:02X}" for b in data)
 
 
 if __name__ == "__main__":

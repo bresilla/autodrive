@@ -48,6 +48,7 @@ PGN_ADWPI = 0xFFCD
 ADWPI_COORD_OFFSET_CM = -250_000
 ADWPI_COORD_RAW_MAX = (1 << 20) - 1
 LATLON_ZERO_RAW = 2_100_000_000
+PROTOCOL_U16_MAX = 65_530
 
 # ADWPI byte-8 flags. 2-bit J1939 fields, "on" = 01. Editable — bit positions
 # were among the questioned items in the proposal.
@@ -132,6 +133,10 @@ def unavailable_u32(raw: int) -> bool:
     return raw == 0xFFFFFFFF
 
 
+def unavailable_u16(raw: int) -> bool:
+    return raw == 0xFFFF
+
+
 def decode_latlon_u32(raw: int) -> float | None:
     """u32 → degrees, 1e-7 deg/bit, offset -210. 0xFFFFFFFF means unavailable."""
     if unavailable_u32(raw):
@@ -165,8 +170,9 @@ def decode_vds(data: bytes, status: MachineStatus) -> None:
         return
     compass = struct.unpack_from("<H", data, 0)[0]
     speed = struct.unpack_from("<H", data, 2)[0]
-    status.heading_deg = compass / 128.0
-    status.speed_kph = speed / 256.0
+    heading_deg = compass / 128.0
+    status.heading_deg = None if unavailable_u16(compass) or heading_deg >= 360.0 else heading_deg
+    status.speed_kph = 0.0 if unavailable_u16(speed) else speed / 256.0
     status.last_rx_s = time.monotonic()
 
 
@@ -218,8 +224,9 @@ def process_frame(frame: CanFrame, status: MachineStatus) -> int:
 # MESSAGE ENCODERS (us → Display)
 # =============================================================================
 
-def clamp_u16(value: int) -> int:
-    return max(0, min(0xFFFF, int(value)))
+def clamp_protocol_u16(value: int) -> int:
+    """Clamp fields whose spec range is 0..65530."""
+    return max(0, min(PROTOCOL_U16_MAX, int(value)))
 
 
 def encode_adjob(system_active: bool, run_command: bool, current_index: int,
@@ -235,9 +242,9 @@ def encode_adjob(system_active: bool, run_command: bool, current_index: int,
     b = bytearray(8)
     b[0] = 0
     b[1] = ((error_code & 0x0F) << 4) | (0x04 if run_command else 0) | (0x01 if system_active else 0)
-    struct.pack_into("<H", b, 2, clamp_u16(current_index))
-    struct.pack_into("<H", b, 4, clamp_u16(total_points))
-    struct.pack_into("<H", b, 6, clamp_u16(job_id))
+    struct.pack_into("<H", b, 2, clamp_protocol_u16(current_index))
+    struct.pack_into("<H", b, 4, clamp_protocol_u16(total_points))
+    struct.pack_into("<H", b, 6, clamp_protocol_u16(job_id))
     return bytes(b)
 
 
@@ -283,7 +290,7 @@ def encode_adwpi(point: Waypoint) -> bytes:
         flags |= ADWPI_FLAG_REVERSE
 
     b = bytearray(8)
-    struct.pack_into("<H", b, 0, clamp_u16(point.index))
+    struct.pack_into("<H", b, 0, clamp_protocol_u16(point.index))
     b[2] = east_raw & 0xFF
     b[3] = (east_raw >> 8) & 0xFF
     b[4] = ((east_raw >> 16) & 0x0F) | ((north_raw & 0x0F) << 4)

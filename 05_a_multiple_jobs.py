@@ -12,9 +12,10 @@ What this step proves:
   * each new Job ID (with SystemActive) starts a fresh job on the display
   * a stable Job ID does NOT restart the job — only a change does
 
-⚠️ This sets SystemActive=true (RunCommand stays off — nothing drives). On a real
-   machine the display may need PPP + AutoDrive-allowed before it accepts
-   SystemActive; the gate status is printed each cycle so you can tell.
+RunCommand stays off — nothing drives. The script only sets SystemActive=true
+when the normal gates pass (PPP + AutoDrive allowed + inside the route field).
+The gate status is printed each cycle so you can tell why a job did or did not
+start.
 
 Run:
     ./05_a_multiple_jobs.py
@@ -29,16 +30,28 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import autodrive as a
+import routes
 
 JOB_IDS = [101, 102, 103, 104]   # the sequence of jobs to start
 HOLD_S = 3.0                     # how long to hold each job before the next
+FIELD_MARGIN_M = 15.0
 
 
 def yn(b: bool) -> str:
     return "Y" if b else "-"
 
 
+def inside_field(status, field, datum_lat, datum_lon) -> bool:
+    if status.gps_lat is None or status.gps_lon is None:
+        return False
+    x, y = a.wgs_to_enu_approx(status.gps_lat, status.gps_lon, datum_lat, datum_lon)
+    return a.point_inside_polygon(x, y, field)
+
+
 def main() -> None:
+    route, datum_lat, datum_lon = routes.ROUTES["line"]()
+    field = routes.bounding_field(route, FIELD_MARGIN_M)
+    total_points = len(route)
     bus = a.make_bus()
     status = a.MachineStatus()
 
@@ -55,12 +68,18 @@ def main() -> None:
             now = time.monotonic() - t0
             if now - last_adjob >= a.ADJOB_PERIOD_S:
                 last_adjob = now
-                data = a.encode_adjob(system_active=True, run_command=False,
-                                      current_index=0, total_points=0, job_id=job_id)
+                active = (status.gps_ppp_available
+                          and status.autodrive_allowed
+                          and inside_field(status, field, datum_lat, datum_lon))
+                data = a.encode_adjob(system_active=active, run_command=False,
+                                      current_index=0, total_points=total_points,
+                                      job_id=job_id)
                 a.send(bus, a.PGN_ADJOB, data)
-                print(f"[{now:5.1f}s] ADJOB job_id={job_id} active=Y  "
+                print(f"[{now:5.1f}s] ADJOB job_id={job_id} active={yn(active)} "
+                      f"total_points={total_points} "
                       f"(ppp={yn(status.gps_ppp_available)} "
                       f"allowed={yn(status.autodrive_allowed)} "
+                      f"inside={yn(inside_field(status, field, datum_lat, datum_lon))} "
                       f"anchor={'Y' if status.anchor_lat is not None else '-'})")
             time.sleep(0.02)
 

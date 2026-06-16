@@ -35,6 +35,7 @@ import routes
 # Datum is taken from the loaded route's first vertex in main(); placeholder here.
 DATUM_LAT, DATUM_LON = 0.0, 0.0
 RUN_SECONDS = 60.0
+FIELD_MARGIN_M = 15.0
 RESEND_EVERY_S = 1.0
 NEAREST_BACKTRACK = 3
 # Keep the nearest-point search local: a window much larger than the machine's
@@ -66,6 +67,13 @@ def estimate_index(status, route, previous):
     return max(previous, best)
 
 
+def inside_field(status, field) -> bool:
+    if status.gps_lat is None or status.gps_lon is None:
+        return False
+    x, y = a.wgs_to_enu_approx(status.gps_lat, status.gps_lon, DATUM_LAT, DATUM_LON)
+    return a.point_inside_polygon(x, y, field)
+
+
 def stream_window(bus, status, waypoints, current_index):
     """Stream the rolling window. Returns the exclusive end index reached, so the
     caller can tell how much of the line is on the bus (for the run gate)."""
@@ -81,6 +89,8 @@ def stream_window(bus, status, waypoints, current_index):
 def main() -> None:
     global DATUM_LAT, DATUM_LON
     route, DATUM_LAT, DATUM_LON = routes.geojson_route(routes.geojson_path("line"))
+    field = routes.bounding_field(route, FIELD_MARGIN_M)
+    job_id = int(time.time()) % (a.PROTOCOL_U16_MAX + 1)
     bus = a.make_bus()
     status = a.MachineStatus()
 
@@ -90,6 +100,7 @@ def main() -> None:
     t0 = time.monotonic()
     last_adjob = -999.0
     last_window = -999.0
+    print(f"run/track: route='line' ({len(route)} pts) job_id={job_id}")
 
     while True:
         now = time.monotonic() - t0
@@ -99,7 +110,9 @@ def main() -> None:
         if frame is not None:
             a.process_frame(frame, status)
 
-        active = status.gps_ppp_available and status.autodrive_allowed
+        active = (status.gps_ppp_available
+                  and status.autodrive_allowed
+                  and inside_field(status, field))
 
         if active and status.anchor_lat is not None and not waypoints:
             waypoints = build_waypoints(route, status.anchor_lat, status.anchor_lon)
@@ -122,7 +135,8 @@ def main() -> None:
                 system_active=active,
                 run_command=active and run_command,
                 current_index=current_index,
-                total_points=len(waypoints) if waypoints else len(route)))
+                total_points=len(waypoints) if waypoints else len(route),
+                job_id=job_id))
             if waypoints:
                 print(f"[{now:5.1f}s] progress {current_index:3}/{len(waypoints)}  "
                       f"engaged={'Y' if status.autodrive_engaged else '-'}  "

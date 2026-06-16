@@ -2,20 +2,22 @@
 """
 Consume api_server.py state and visualize it in Rerun.
 
-It logs three live 2D entities:
+It logs live geospatial entities on a Rerun map:
   * autodrive/position       point at the machine position
   * autodrive/anchorpoint    point at the DSAP anchor
   * autodrive/machine_line   heading line starting at the machine position
+  * autodrive/trail          recent machine path, bounded by --trail-seconds
 
 Run:
     ./rerun_consumer.py
-    ./rerun_consumer.py --api http://OTHER_MACHINE_IP:8080/state
+    ./rerun_consumer.py --api http://172.30.0.137:8080/state
     ./rerun_consumer.py --save autodrive.rrd --no-spawn
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import math
 import os
@@ -30,13 +32,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autodrive as a
 
 
-DEFAULT_API = "http://127.0.0.1:8080/state"
+DEFAULT_API = "http://172.30.0.137:8080/state"
 DEFAULT_POLL_HZ = 5.0
 MACHINE_LINE_LENGTH_M = 8.0
+DEFAULT_TRAIL_SECONDS = 1800.0
 
 
 LatLon = tuple[float, float]
-Point2D = list[float]
+TrailPoint = tuple[float, LatLon]
 
 
 def fetch_state(url: str, timeout_s: float) -> dict[str, Any]:
@@ -54,25 +57,45 @@ def latlon_from(section: dict[str, Any] | None) -> LatLon | None:
     return float(lat), float(lon)
 
 
-def choose_origin(state: dict[str, Any], current: LatLon | None) -> LatLon | None:
-    anchor = latlon_from(state.get("anchorpoint"))
-    if anchor is not None:
-        return anchor
-    return current
-
-
-def to_xy(point: LatLon, origin: LatLon) -> Point2D:
-    east, north = a.wgs_to_enu_approx(point[0], point[1], origin[0], origin[1])
-    return [east, north]
-
-
-def machine_line(position_xy: Point2D, heading_deg: float | None, length_m: float) -> list[Point2D] | None:
+def machine_line(position: LatLon, heading_deg: float | None, length_m: float) -> list[LatLon] | None:
     if heading_deg is None:
         return None
     heading_rad = math.radians(heading_deg)
     east = math.sin(heading_rad) * length_m
     north = math.cos(heading_rad) * length_m
-    return [position_xy, [position_xy[0] + east, position_xy[1] + north]]
+    end_lat, end_lon = a.enu_to_wgs_approx(east, north, position[0], position[1])
+    return [position, (end_lat, end_lon)]
+
+
+def movement_heading_deg(previous: LatLon, current: LatLon) -> float | None:
+    east, north = a.wgs_to_enu_approx(current[0], current[1], previous[0], previous[1])
+    if math.hypot(east, north) < 0.05:
+        return None
+    return math.degrees(math.atan2(east, north)) % 360.0
+
+
+def heading_from_state(position: dict[str, Any], trail: collections.deque[TrailPoint]) -> float | None:
+    heading = position.get("heading_deg")
+    if heading is not None:
+        return float(heading)
+    if len(trail) < 2:
+        return None
+    return movement_heading_deg(trail[-2][1], trail[-1][1])
+
+
+def map_blueprint(zoom: float):
+    import rerun.blueprint as rrb
+
+    return rrb.Blueprint(
+        rrb.MapView(
+            origin="autodrive",
+            contents="autodrive/**",
+            name="AutoDrive Map",
+            zoom=zoom,
+            background=rrb.MapProvider.OpenStreetMap,
+        ),
+        collapse_panels=True,
+    )
 
 
 def configure_rerun(args: argparse.Namespace) -> None:
@@ -81,64 +104,90 @@ def configure_rerun(args: argparse.Namespace) -> None:
     except Exception as exc:
         raise SystemExit("rerun-sdk missing. Enter the nix develop shell.") from exc
 
-    rr.init("autodrive_rest_consumer")
+    blueprint = map_blueprint(args.zoom)
+    rr.init("autodrive_rest_consumer", default_blueprint=blueprint)
     if args.save:
         rr.save(args.save)
     if args.connect_grpc:
         rr.connect_grpc(args.connect_grpc)
     if args.spawn:
         rr.spawn()
+    rr.send_blueprint(blueprint)
 
 
-def log_to_rerun(state: dict[str, Any], origin: LatLon, line_length_m: float) -> bool:
+def prune_trail(trail: collections.deque[TrailPoint], now_s: float, keep_s: float) -> None:
+    while trail and now_s - trail[0][0] > keep_s:
+        trail.popleft()
+
+
+def log_to_rerun(
+    state: dict[str, Any],
+    line_length_m: float,
+    trail: collections.deque[TrailPoint],
+    heading_history: collections.deque[TrailPoint],
+    trail_seconds: float,
+) -> bool:
     import rerun as rr
 
-    rr.set_time("poll", sequence=int(state.get("_sequence", 0)))
-    rr.set_time("time", timestamp=time.time())
-
+    now_s = time.time()
     position = state.get("position") or {}
     position_latlon = latlon_from(position)
     anchor_latlon = latlon_from(state.get("anchorpoint"))
     logged_any = False
 
     if position_latlon is not None:
-        position_xy = to_xy(position_latlon, origin)
+        heading_history.append((now_s, position_latlon))
+        while len(heading_history) > 2:
+            heading_history.popleft()
+
         rr.log(
             "autodrive/position",
-            rr.Points2D(
-                [position_xy],
+            rr.GeoPoints(
+                lat_lon=[position_latlon],
                 colors=[[0, 180, 255]],
-                radii=[0.7],
-                labels=["position"],
-                show_labels=True,
+                radii=rr.Radius.ui_points(12.0),
             ),
+            static=True,
         )
         logged_any = True
 
-        line = machine_line(position_xy, position.get("heading_deg"), line_length_m)
+        if trail_seconds > 0:
+            trail.append((now_s, position_latlon))
+            prune_trail(trail, now_s, trail_seconds)
+
+        line = machine_line(position_latlon, heading_from_state(position, heading_history), line_length_m)
         if line is not None:
             rr.log(
                 "autodrive/machine_line",
-                rr.LineStrips2D(
-                    [line],
+                rr.GeoLineStrings(
+                    lat_lon=line,
                     colors=[[255, 170, 0]],
-                    radii=[0.25],
-                    labels=["heading"],
-                    show_labels=True,
+                    radii=rr.Radius.ui_points(3.0),
                 ),
+                static=True,
             )
 
+        if trail_seconds > 0:
+            if len(trail) >= 2:
+                rr.log(
+                    "autodrive/trail",
+                    rr.GeoLineStrings(
+                        lat_lon=[point for _, point in trail],
+                        colors=[[0, 120, 255]],
+                        radii=rr.Radius.ui_points(2.0),
+                    ),
+                    static=True,
+                )
+
     if anchor_latlon is not None:
-        anchor_xy = to_xy(anchor_latlon, origin)
         rr.log(
             "autodrive/anchorpoint",
-            rr.Points2D(
-                [anchor_xy],
+            rr.GeoPoints(
+                lat_lon=[anchor_latlon],
                 colors=[[0, 220, 120]],
-                radii=[0.9],
-                labels=["anchor"],
-                show_labels=True,
+                radii=rr.Radius.ui_points(12.0),
             ),
+            static=True,
         )
         logged_any = True
 
@@ -151,6 +200,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-hz", default=DEFAULT_POLL_HZ, type=float, help=f"Poll rate (default: {DEFAULT_POLL_HZ})")
     parser.add_argument("--timeout", default=2.0, type=float, help="HTTP request timeout in seconds")
     parser.add_argument("--line-length", default=MACHINE_LINE_LENGTH_M, type=float, help="Machine heading line length in metres")
+    parser.add_argument(
+        "--trail-seconds",
+        default=DEFAULT_TRAIL_SECONDS,
+        type=float,
+        help=f"Seconds of recent position trail to keep; use 0 to disable (default: {DEFAULT_TRAIL_SECONDS})",
+    )
+    parser.add_argument("--zoom", default=18.0, type=float, help="Initial Rerun map zoom level")
     parser.add_argument("--connect-grpc", help="Connect to an existing Rerun gRPC server URL")
     parser.add_argument("--save", help="Write a Rerun .rrd recording instead of only viewing live")
     parser.add_argument("--no-spawn", dest="spawn", action="store_false", help="Do not spawn the Rerun viewer")
@@ -162,14 +218,16 @@ def main() -> None:
     args = parse_args()
     if args.poll_hz <= 0:
         raise SystemExit("--poll-hz must be greater than zero")
+    if args.trail_seconds < 0:
+        raise SystemExit("--trail-seconds must be zero or greater")
 
     configure_rerun(args)
     poll_period_s = 1.0 / args.poll_hz
-    origin: LatLon | None = None
-    sequence = 0
+    trail: collections.deque[TrailPoint] = collections.deque()
+    heading_history: collections.deque[TrailPoint] = collections.deque()
 
     print(f"Reading {args.api}", file=sys.stderr)
-    print("Logging to Rerun. Press Ctrl-C to stop.", file=sys.stderr)
+    print("Logging geospatial data to a Rerun map. Press Ctrl-C to stop.", file=sys.stderr)
 
     while True:
         try:
@@ -179,16 +237,7 @@ def main() -> None:
             time.sleep(poll_period_s)
             continue
 
-        position_latlon = latlon_from(state.get("position"))
-        if origin is None:
-            origin = choose_origin(state, position_latlon)
-            if origin is not None:
-                print(f"Rerun origin lat={origin[0]:.7f} lon={origin[1]:.7f}", file=sys.stderr)
-
-        if origin is not None:
-            state["_sequence"] = sequence
-            log_to_rerun(state, origin, args.line_length)
-            sequence += 1
+        log_to_rerun(state, args.line_length, trail, heading_history, args.trail_seconds)
 
         time.sleep(poll_period_s)
 

@@ -269,7 +269,8 @@ Standard SAE message; the header-centre ground position.
 | 7-8   | Altitude      | u16, `0.125 m/bit`, offset −2500 m |
 
 The script decodes bearing and speed (`decode_vds`); pitch/altitude are available but
-unused. Note the compass may be wrong/undetermined before the machine has moved.
+unused. `0xFFFF` in the compass or speed field means unavailable. Note the compass
+may be wrong/undetermined before the machine has moved.
 
 ### 6.3 DSSTAT — DirectSteer Status  (`0xFFCA`, RX)
 
@@ -334,7 +335,8 @@ b[1] = ((error_code & 0x0F) << 4) | (0x04 if run_command else 0) | (0x01 if syst
 > **Job ID starts the job** (per [`spec/spec2.md`](spec2.md)). The Job ID must
 > change when you move to a different field; a **change of Job ID together with
 > SystemActive** is what makes the display start a *new* job (recompute anchor,
-> clear the coverage map). The scripts use a fixed Job ID for a single field.
+> clear the coverage map). The anchor scripts default to a fresh time-based Job ID;
+> pass `--job-id` when you intentionally want to reuse or control it.
 >
 > **SystemActive** means, to the display: we have confirmed *PPP ready* and have
 > *lines ready to stream*. **Current waypoint index** is the point the machine is

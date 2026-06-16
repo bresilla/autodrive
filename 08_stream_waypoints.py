@@ -32,6 +32,14 @@ import routes
 
 TARGET_POINTS = 120                 # how many waypoints we want to stream
 MIN_SPACING_M = 0.3                 # AgJunction minimum point spacing (PROTOCOL.md §8.5)
+FIELD_MARGIN_M = 15.0
+
+
+def inside_field(status, field, datum_lat, datum_lon) -> bool:
+    if status.gps_lat is None or status.gps_lon is None:
+        return False
+    x, y = a.wgs_to_enu_approx(status.gps_lat, status.gps_lon, datum_lat, datum_lon)
+    return a.point_inside_polygon(x, y, field)
 
 
 def line_spacing_for_points(target: int):
@@ -78,8 +86,11 @@ def stream_window(bus, status, waypoints, current_index, count=TARGET_POINTS):
 
 def main() -> None:
     route_path, point_count, spacing = line_spacing_for_points(TARGET_POINTS)
+    gate_route, datum_lat, datum_lon = routes.geojson_route(route_path, spacing_m=spacing)
+    field = routes.bounding_field(gate_route, FIELD_MARGIN_M)
+    job_id = int(time.time()) % (a.PROTOCOL_U16_MAX + 1)
     print(f"line route: {point_count} points at {spacing:.3f} m spacing "
-          f"(target {TARGET_POINTS})", file=sys.stderr)
+          f"(target {TARGET_POINTS}), job_id={job_id}", file=sys.stderr)
     if spacing < MIN_SPACING_M:
         print(f"note: {spacing:.3f} m spacing is below the AgJunction {MIN_SPACING_M} m "
               f"minimum (fine for drawing the line; tighten the route to fix).", file=sys.stderr)
@@ -88,11 +99,26 @@ def main() -> None:
 
     # Activate so the Display gives us an anchor.
     t0 = time.monotonic()
+    last_adjob = -999.0
     while status.anchor_lat is None and time.monotonic() - t0 < 10.0:
         frame = bus.recv(timeout=0.05)
         if frame is not None:
             a.process_frame(frame, status)
-        a.send(bus, a.PGN_ADJOB, a.encode_adjob(True, False, 0, point_count))
+        now = time.monotonic() - t0
+        active = (status.gps_ppp_available
+                  and status.autodrive_allowed
+                  and inside_field(status, field, datum_lat, datum_lon))
+        if now - last_adjob >= a.ADJOB_PERIOD_S:
+            last_adjob = now
+            a.send(bus, a.PGN_ADJOB, a.encode_adjob(
+                system_active=active,
+                run_command=False,
+                current_index=0,
+                total_points=point_count,
+                job_id=job_id,
+            ))
+            print(f"[{now:4.1f}s] ADJOB systemActive={'Y' if active else '-'} "
+                  f"job_id={job_id} total_points={point_count}")
 
     if status.anchor_lat is None:
         print("no anchor — cannot stream. Is the Display/simulator running, and "

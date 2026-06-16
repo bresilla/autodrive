@@ -14,8 +14,8 @@ What this step proves:
   * the display issues a fresh anchor (DSAP) per job — watch it change if the
     machine has moved between jobs
 
-⚠️ RunCommand stays off — nothing drives. On a real machine the display may need
-   PPP + AutoDrive-allowed before it accepts SystemActive.
+RunCommand stays off — nothing drives. The script only sets SystemActive=true
+when the normal gates pass (PPP + AutoDrive allowed + inside the route field).
 
 Run:
     ./05_b_job_restart.py
@@ -30,25 +30,35 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import autodrive as a
+import routes
 
 JOB_IDS = [201, 202, 203]   # one job per "field"
 ACTIVE_S = 3.0              # hold each job active
 GAP_S = 1.5                # SystemActive off between jobs
+FIELD_MARGIN_M = 15.0
 
 
 def yn(b: bool) -> str:
     return "Y" if b else "-"
 
 
-def send_adjob(bus, active: bool, job_id: int, t0: float) -> None:
+def inside_field(status, field, datum_lat, datum_lon) -> bool:
+    if status.gps_lat is None or status.gps_lon is None:
+        return False
+    x, y = a.wgs_to_enu_approx(status.gps_lat, status.gps_lon, datum_lat, datum_lon)
+    return a.point_inside_polygon(x, y, field)
+
+
+def send_adjob(bus, active: bool, job_id: int, total_points: int, t0: float) -> None:
     now = time.monotonic() - t0
     data = a.encode_adjob(system_active=active, run_command=False,
-                          current_index=0, total_points=0, job_id=job_id)
+                          current_index=0, total_points=total_points, job_id=job_id)
     a.send(bus, a.PGN_ADJOB, data)
-    print(f"[{now:5.1f}s] ADJOB job_id={job_id} active={yn(active)}")
+    print(f"[{now:5.1f}s] ADJOB job_id={job_id} active={yn(active)} total_points={total_points}")
 
 
-def hold(bus, status, active: bool, job_id: int, t0: float, seconds: float) -> None:
+def hold(bus, status, requested_active: bool, job_id: int, total_points: int,
+         field, datum_lat: float, datum_lon: float, t0: float, seconds: float) -> None:
     """Transmit ADJOB at 1 Hz for `seconds`, draining RX in between."""
     last = -999.0
     end = time.monotonic() + seconds
@@ -56,11 +66,18 @@ def hold(bus, status, active: bool, job_id: int, t0: float, seconds: float) -> N
         a.drain_rx(bus, status)
         if time.monotonic() - last >= a.ADJOB_PERIOD_S:
             last = time.monotonic()
-            send_adjob(bus, active, job_id, t0)
+            active = (requested_active
+                      and status.gps_ppp_available
+                      and status.autodrive_allowed
+                      and inside_field(status, field, datum_lat, datum_lon))
+            send_adjob(bus, active, job_id, total_points, t0)
         time.sleep(0.02)
 
 
 def main() -> None:
+    route, datum_lat, datum_lon = routes.ROUTES["line"]()
+    field = routes.bounding_field(route, FIELD_MARGIN_M)
+    total_points = len(route)
     bus = a.make_bus()
     status = a.MachineStatus()
 
@@ -71,7 +88,9 @@ def main() -> None:
     last_anchor = None
     for i, job_id in enumerate(JOB_IDS):
         print(f"\n--- Job {i + 1}/{len(JOB_IDS)}: id={job_id} ---")
-        hold(bus, status, active=True, job_id=job_id, t0=t0, seconds=ACTIVE_S)
+        hold(bus, status, requested_active=True, job_id=job_id,
+             total_points=total_points, field=field, datum_lat=datum_lat,
+             datum_lon=datum_lon, t0=t0, seconds=ACTIVE_S)
 
         anchor = (status.anchor_lat, status.anchor_lon)
         if status.anchor_lat is not None and anchor != last_anchor:
@@ -80,7 +99,9 @@ def main() -> None:
 
         if i < len(JOB_IDS) - 1:
             print(f"    ending job {job_id} (SystemActive=off for {GAP_S:.1f}s)")
-            hold(bus, status, active=False, job_id=job_id, t0=t0, seconds=GAP_S)
+            hold(bus, status, requested_active=False, job_id=job_id,
+                 total_points=total_points, field=field, datum_lat=datum_lat,
+                 datum_lon=datum_lon, t0=t0, seconds=GAP_S)
 
     print(f"\nran {len(JOB_IDS)} job cycles. Each reactivation with a new Job ID "
           f"should show as a fresh job on the display/simulator.")
