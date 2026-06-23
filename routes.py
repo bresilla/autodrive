@@ -146,24 +146,19 @@ def _load_linestring(path: str) -> list[tuple[float, float]]:
 
 def _resample(vertices: list[tuple[float, float]], spacing_m: float
               ) -> list[tuple[float, float]]:
-    """Resample a polyline to ~`spacing_m` even steps, endpoints included."""
+    """Resample each segment to at most `spacing_m`, preserving original vertices."""
     if len(vertices) < 2:
         return list(vertices)
-    cum = [0.0]
+
+    out = [vertices[0]]
     for (x0, y0), (x1, y1) in zip(vertices, vertices[1:]):
-        cum.append(cum[-1] + math.hypot(x1 - x0, y1 - y0))
-    total = cum[-1]
-    n = max(1, math.ceil(total / spacing_m))
-    out, seg = [], 0
-    for k in range(n + 1):
-        target = min(total, k * total / n)
-        while seg < len(cum) - 2 and cum[seg + 1] < target:
-            seg += 1
-        seg_len = cum[seg + 1] - cum[seg]
-        f = 0.0 if seg_len == 0 else (target - cum[seg]) / seg_len
-        x0, y0 = vertices[seg]
-        x1, y1 = vertices[seg + 1]
-        out.append((x0 + (x1 - x0) * f, y0 + (y1 - y0) * f))
+        seg_len = math.hypot(x1 - x0, y1 - y0)
+        if seg_len == 0.0:
+            continue
+        steps = max(1, math.ceil(seg_len / spacing_m))
+        for i in range(1, steps + 1):
+            f = i / steps
+            out.append((x0 + (x1 - x0) * f, y0 + (y1 - y0) * f))
     return out
 
 
