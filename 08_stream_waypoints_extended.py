@@ -34,6 +34,7 @@ DEFAULT_WINDOW_SIZE = a.FUTURE_POINT_COUNT
 DEFAULT_TRIGGER_FRACTION = 0.70
 DEFAULT_NEAREST_BACKTRACK = 6
 DEFAULT_NEAREST_AHEAD = 160
+DEFAULT_OVERLAP_FROM_TRIGGER_OFFSET = 1
 MIN_SPACING_M = 0.3
 FIELD_MARGIN_M = 15.0
 
@@ -63,6 +64,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_TRIGGER_FRACTION,
         help=f"send next window after this fraction of the current unique window (default: {DEFAULT_TRIGGER_FRACTION})",
+    )
+    parser.add_argument(
+        "--overlap-from-trigger-offset",
+        type=int,
+        default=DEFAULT_OVERLAP_FROM_TRIGGER_OFFSET,
+        help="start the next sent batch this many points after the trigger point; "
+             f"default {DEFAULT_OVERLAP_FROM_TRIGGER_OFFSET} starts at trigger+1",
     )
     parser.add_argument(
         "--nearest-ahead",
@@ -198,16 +206,14 @@ def stream_next_window(
     bus,
     status: a.MachineStatus,
     waypoints: list[a.Waypoint],
-    next_unsent: int,
+    window_start: int,
     window_size: int,
-) -> tuple[int, int, int, int]:
-    """Send overlap plus the next window_size new points. Returns start, end, sent, next_unsent."""
-    unique_start = next_unsent
-    unique_end = min(len(waypoints), unique_start + window_size)
-    start = max(0, unique_start - a.WINDOW_OVERLAP_POINTS)
-    end = unique_end
+) -> tuple[int, int, int]:
+    """Send exactly window_size points from window_start, capped at route end."""
+    start = max(0, min(window_start, len(waypoints)))
+    end = min(len(waypoints), start + window_size)
     sent = stream_indices(bus, status, waypoints, start, end)
-    return start, end, sent, unique_end
+    return start, end, sent
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -221,6 +227,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--nearest-ahead must be at least 1")
     if args.nearest_backtrack < 0:
         raise SystemExit("--nearest-backtrack must be zero or greater")
+    if args.overlap_from_trigger_offset < 0:
+        raise SystemExit("--overlap-from-trigger-offset must be zero or greater")
     if args.loop_timeout < 0:
         raise SystemExit("--loop-timeout must be zero or greater")
 
@@ -293,19 +301,20 @@ def main() -> None:
     xy = route_xy(route)
     current_index = 0
     run_command = False
-    next_unsent = 0
     current_window_start = 0
+    current_window_end = 0
     sent_until = 0
     total_frames = 0
     batch_no = 0
 
     print(f"anchored at {anchor_lat:.7f},{anchor_lon:.7f}; {len(waypoints)} waypoints ready\n")
 
-    start, end, sent, next_unsent = stream_next_window(bus, status, waypoints, next_unsent, args.window_size)
+    start, end, sent = stream_next_window(bus, status, waypoints, 0, args.window_size)
     batch_no += 1
     total_frames += sent
-    current_window_start = 0
-    sent_until = next_unsent
+    current_window_start = start
+    current_window_end = end
+    sent_until = max(sent_until, end)
     run_command = sent_until >= min(a.FUTURE_POINT_COUNT, len(waypoints))
     print(f"batch {batch_no}: streamed indices [{start}..{end - 1}], {sent} frames (new [0..{sent_until - 1}])")
 
@@ -335,19 +344,24 @@ def main() -> None:
             args.nearest_ahead,
         )
 
-        unique_len = max(1, sent_until - current_window_start)
-        trigger_index = min(sent_until - 1, current_window_start + math.floor(unique_len * args.trigger_fraction))
-        if active and next_unsent < len(waypoints) and current_index >= trigger_index:
-            previous_unsent = next_unsent
-            start, end, sent, next_unsent = stream_next_window(bus, status, waypoints, next_unsent, args.window_size)
+        window_len = max(1, current_window_end - current_window_start)
+        trigger_index = min(
+            current_window_end - 1,
+            current_window_start + math.floor(window_len * args.trigger_fraction),
+        )
+        if active and current_window_end < len(waypoints) and current_index >= trigger_index:
+            next_window_start = min(current_window_end, trigger_index + args.overlap_from_trigger_offset)
+            start, end, sent = stream_next_window(bus, status, waypoints, next_window_start, args.window_size)
             batch_no += 1
             total_frames += sent
-            current_window_start = previous_unsent
-            sent_until = next_unsent
+            current_window_start = start
+            current_window_end = end
+            previous_sent_until = sent_until
+            sent_until = max(sent_until, end)
             print(
                 f"batch {batch_no}: progress {current_index}/{len(waypoints) - 1} crossed {trigger_index}; "
                 f"streamed indices [{start}..{end - 1}], {sent} frames "
-                f"(new [{previous_unsent}..{next_unsent - 1}])"
+                f"(new [{previous_sent_until}..{sent_until - 1}])"
             )
 
         now = time.monotonic() - t0
@@ -359,11 +373,11 @@ def main() -> None:
             print(
                 f"[{now:6.1f}s] active={'Y' if active else '-'} run={'Y' if (active and run_command) else '-'} "
                 f"progress={current_index}/{len(waypoints) - 1} sent_until={sent_until}/{len(waypoints)} "
-                f"next_trigger={trigger_index if next_unsent < len(waypoints) else 'done'} "
+                f"next_trigger={trigger_index if current_window_end < len(waypoints) else 'done'} "
                 f"spd={status.speed_kph or 0.0:.1f}kph"
             )
 
-        if next_unsent >= len(waypoints) and current_index >= len(waypoints) - 1:
+        if current_window_end >= len(waypoints) and current_index >= len(waypoints) - 1:
             break
 
     print(
