@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Step 08 extended — stream every waypoint in protocol-sized ADWPI batches.
+Step 08 extended — stream every waypoint in one ADWPI burst by default.
 
-This keeps the original 08_stream_waypoints.py untouched, but avoids one huge
-burst by default. It sends 100-frame windows with 3-point overlap until every
-unique waypoint index has been sent, so long routes and generated U-turns do not
-depend on the receiver accepting one continuous burst.
+This keeps the original 08_stream_waypoints.py untouched, but adds stricter
+coverage logging. By default it sends every waypoint in one batch. Passing
+--batch-size switches to repeated windows with overlap.
 
 What this step proves:
   * full route: stream all waypoints by default
@@ -34,7 +33,7 @@ import autodrive as a
 import routes
 
 DEFAULT_MAX_SPACING_M = 1.0         # interpolate route points at least every metre
-DEFAULT_BATCH_SIZE = a.FUTURE_POINT_COUNT  # protocol-sized batches; all points are still sent
+DEFAULT_BATCH_SIZE = 0              # 0 = stream the whole route in one batch
 MIN_SPACING_M = 0.3                 # AgJunction minimum point spacing (PROTOCOL.md §8.5)
 FIELD_MARGIN_M = 15.0
 
