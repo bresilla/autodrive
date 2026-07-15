@@ -1943,7 +1943,11 @@ class StreamController:
                 if frame is not None:
                     a.process_frame(frame, status)
 
-                inside = sp.inside_field(status, field, anchor_lat, anchor_lon)
+                # field polygon lives in the datum frame (built from gate_route), so
+                # inside_field must be evaluated in datum coords — exactly as
+                # send_points.py does (its line 340). estimate_progress_index below
+                # uses the anchor frame because xy was re-resolved about the anchor.
+                inside = sp.inside_field(status, field, datum_lat, datum_lon)
                 active = status.gps_ppp_available and status.autodrive_allowed and (no_inside_gate or inside)
                 current_index = sp.estimate_progress_index(
                     status, xy, anchor_lat, anchor_lon, current_index,
