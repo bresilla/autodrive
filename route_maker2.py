@@ -58,7 +58,7 @@ import routes
 import send_points as sp
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_HOST = "127.0.0.1"
+DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8090
 DEFAULT_API = "http://172.30.0.137:8080/state"
 DEFAULT_OUTPUT = "line.geojson"
@@ -2132,7 +2132,8 @@ def make_handler(default_output: str, upstream_api: str, api_timeout_s: float):
         server_version = "AutoDriveRouteMaker/1.0"
 
         def log_message(self, format: str, *args: object) -> None:
-            print(f"{self.address_string()} - {format % args}", file=sys.stderr)
+            # Silence per-request access logs (the browser polls /state constantly).
+            pass
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
