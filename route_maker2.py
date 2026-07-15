@@ -1,32 +1,48 @@
 #!/usr/bin/env python3
 """
-route_maker.py — map-first route editor for AutoDrive GeoJSON routes.
+route_maker2.py — route editor + live waypoint streaming to the machine.
 
-The browser UI proxies a remote api_server.py /state endpoint, shows the live
-machine position, lets you draw/edit a GeoJSON LineString, and saves it to a
-route file consumed by the streaming steps:
+route_maker.py, plus a Play/Stop control that streams the route to the Display
+over CAN and draws what the stream is actually doing on the map:
 
-    ./route_maker.py --api http://172.30.0.137:8080/state
-    ./08_stream_waypoints.py --route line
+    ./route_maker2.py --can-bus can0 --api http://172.30.0.137:8080/state
 
-Tools: Select / Draw / Turn. The Turn tool lays a circular arc of any sweep
-(45 / 90 / 180 deg) at a chosen radius and side, optionally running a straight
-leg on afterwards so the turn joins the next swath instead of dead-ending. It
-checks the result against PROTOCOL.md 8.5 live (<=30 deg/segment, 0.3-4.5 m
-spacing) before you commit it to the route.
+The streaming logic is NOT reimplemented here. This module imports send_points.py
+and drives it — sp.stream_next_window, sp.estimate_progress_index, sp.send_adjob.
+That is deliberate: this repo already has five near-identical copies of the
+streaming loop that have drifted apart (and grown different bugs), and a sixth
+would be worse than none. Change the protocol behaviour in send_points.py and it
+changes here too.
+
+While playing, the map shows the interpolated route split into:
+
+    done      — points the machine has passed (GPS progress index)
+    sent      — the window currently on the Display
+    overlap   — the tail of that window that the NEXT batch will re-send
+    pending   — points not yet streamed
+    trigger   — the index that fires the next batch
+
+Press Stop and it all disappears; you are back in the editor.
+
+*** THIS TRANSMITS ON THE CAN BUS. *** Once enough points are on the Display it
+raises RunCommand, and AutoDrive takes over the steering (per spec/spec2.md the
+operator still supplies forward motion). Stop sends ADJOB systemActive=false.
 
 Single file on purpose: the UI is plain HTML/CSS/JS inlined below. No build
 step, no package manager, no node_modules — edit the HTML string and reload.
 
-The previous version is kept as route_viewer.py, untouched, as a fallback.
+route_maker.py (editor only, never touches CAN) and route_viewer.py (the
+original) are both kept alongside, untouched.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +51,11 @@ from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import autodrive as a
+import routes
+import send_points as sp
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_HOST = "127.0.0.1"
@@ -70,6 +91,8 @@ HTML = r"""<!doctype html>
       --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     }
     *{box-sizing:border-box}
+    /* an explicit display: (flex/grid) otherwise overrides the `hidden` attribute */
+    [hidden]{display:none!important}
     html,body{height:100%}
     body{margin:0;color:var(--ink);background:var(--bg);overflow:hidden}
     button,input,select,textarea{font:inherit;color:inherit}
@@ -168,6 +191,13 @@ HTML = r"""<!doctype html>
     .btn.wide{grid-column:1/-1}
     .r2{display:grid;grid-template-columns:1fr 1fr;gap:7px}
     .r3{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+    /* Side toggle: one click flips Left <-> Right (was a dropdown) */
+    .sidetoggle{width:100%;padding:8px 9px;border-radius:8px;font-size:12px;font-weight:800;cursor:pointer;
+      background:var(--card-2);border:1px solid var(--line-2);color:var(--ink);text-align:center;letter-spacing:.02em;
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .sidetoggle[data-side=left]{border-color:rgba(143,210,228,.4);color:#dff2f9;background:rgba(143,210,228,.12)}
+    .sidetoggle[data-side=right]{border-color:rgba(230,127,78,.42);color:#ffc7a8;background:rgba(230,127,78,.12)}
+    .sidetoggle[data-side=straight]{border-color:rgba(83,214,137,.42);color:#9ff0bb;background:rgba(83,214,137,.12)}
     .presets{display:grid;grid-template-columns:1fr 1fr 1fr 72px;gap:6px}
     .preset{padding:7px 0;font-family:var(--mono)}
     .presets input{text-align:center;font-family:var(--mono)}
@@ -236,6 +266,87 @@ HTML = r"""<!doctype html>
     .card.armed > summary{color:#ffd0b6}
     .card.armed > summary:before{color:var(--orange)}
 
+    /* ---- streaming ---- */
+    .card.stream{border-color:rgba(143,210,228,.22)}
+    .card.stream.live{border-color:rgba(83,214,137,.5);box-shadow:0 0 0 1px rgba(83,214,137,.18)}
+    .card.stream.fault{border-color:rgba(239,154,130,.5)}
+    .play{
+      width:100%;padding:11px;border:0;border-radius:9px;cursor:pointer;
+      font-size:12px;font-weight:800;letter-spacing:.04em;
+      background:rgba(83,214,137,.18);border:1px solid rgba(83,214,137,.42);color:#9ff0bb;
+      transition:background 130ms ease
+    }
+    .play:hover:not(:disabled){background:rgba(83,214,137,.28)}
+    .play:disabled{opacity:.4;cursor:not-allowed}
+    .play.stop{background:rgba(217,65,65,.2);border-color:rgba(217,65,65,.55);color:#ff9c9c}
+    .play.stop:hover{background:rgba(217,65,65,.32)}
+    .chk{display:flex;align-items:center;gap:7px;font-size:9px;color:var(--dim);cursor:pointer}
+    .chk input{width:13px;height:13px;margin:0;accent-color:var(--teal);cursor:pointer}
+    .gates{display:flex;gap:4px}
+    .gates span{
+      flex:1;text-align:center;padding:4px 0;border-radius:5px;font:8px/1.4 var(--mono);font-weight:800;
+      background:var(--card-2);border:1px solid var(--line);color:var(--dim);letter-spacing:.04em
+    }
+    .gates span.on{background:rgba(83,214,137,.18);border-color:rgba(83,214,137,.4);color:#9ff0bb}
+    .gates span.warn{background:rgba(230,127,78,.18);border-color:rgba(230,127,78,.42);color:#ffd0b6}
+    .log{
+      margin:0;max-height:112px;overflow:auto;padding:7px 8px;border-radius:8px;
+      background:#0c1216;border:1px solid var(--line);
+      font:9px/1.5 var(--mono);color:var(--muted);white-space:pre-wrap;word-break:break-word
+    }
+    .legend{
+      position:absolute;bottom:14px;left:14px;z-index:900;display:grid;gap:5px;
+      padding:9px 11px;border-radius:10px;font:9px/1.3 var(--mono);color:var(--muted);
+      background:rgba(13,20,24,.92);border:1px solid var(--line-2);backdrop-filter:blur(10px);
+      box-shadow:0 8px 24px rgba(0,0,0,.32)
+    }
+    .legend span{display:flex;align-items:center;gap:7px;white-space:nowrap}
+    .legend .sw{width:16px;height:3px;border-radius:2px;flex:0 0 auto}
+    .legend .sw.done{background:#53d689}
+    .legend .sw.sent{background:#8fd2e4}
+    .legend .sw.overlap{background:#e6c14e;height:7px}
+    .legend .sw.pending{background:#8fa3ac;opacity:.6}
+    .legend .sw.trig{width:9px;height:9px;border-radius:999px;background:transparent;border:2px solid #e67f4e}
+    /* while streaming the editor is read-only — say so, do not just silently ignore clicks */
+    body.streaming #map{cursor:not-allowed}
+
+    /* ---- top-level PLAN | EXECUTE ---- */
+    .modetabs{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:10px 14px 4px}
+    .modetab{
+      padding:10px;border-radius:9px;cursor:pointer;font-size:12px;font-weight:800;letter-spacing:.06em;
+      background:var(--card);border:1px solid var(--line-2);color:var(--muted);
+      transition:background 120ms ease,color 120ms ease,border-color 120ms ease
+    }
+    .modetab:hover{color:var(--ink)}
+    .modetab.on[data-app="plan"]{background:rgba(143,210,228,.2);border-color:rgba(143,210,228,.42);color:#dff2f9}
+    .modetab.on[data-app="execute"]{background:rgba(83,214,137,.2);border-color:rgba(83,214,137,.46);color:#9ff0bb}
+    .modetab:disabled{opacity:.4;cursor:not-allowed}
+    .appview{flex:1;min-height:0;display:flex;flex-direction:column}
+
+    /* ---- Select / Draw, back inside the Plan panel (Turn arms via its own card) ---- */
+    .tools{display:grid;grid-template-columns:repeat(2,1fr);gap:0;margin:8px 14px 0;
+      background:var(--card);border:1px solid var(--line-2);border-radius:10px;overflow:hidden}
+    .tool{
+      display:grid;gap:2px;justify-items:center;padding:9px 4px;border:0;background:transparent;cursor:pointer;
+      color:var(--muted);border-right:1px solid var(--line);transition:background 120ms ease,color 120ms ease
+    }
+    .tool:last-child{border-right:0}
+    .tool:hover{background:rgba(255,255,255,.04);color:var(--ink)}
+    .tool b{font-size:11px;font-weight:800;letter-spacing:.02em}
+    .tool kbd{font-size:8px;font-family:var(--mono);color:var(--dim);background:none;border:0;padding:0}
+    .tool.on{background:rgba(230,127,78,.18);color:#ffd0b6;box-shadow:inset 0 -2px 0 var(--orange)}
+    .tool.on kbd{color:rgba(255,208,182,.6)}
+
+    /* ---- Execute header ---- */
+    .exec-file{padding:2px 0 2px;display:grid;gap:8px}
+    .exec-file-row{display:flex;align-items:baseline;justify-content:space-between;gap:10px;
+      padding:9px 11px;border-radius:10px;background:var(--card);border:1px solid var(--line-2)}
+    .exec-label{font-size:9px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+    .exec-file-row b{font:12px/1 var(--mono);font-weight:700;color:var(--ink)}
+    .exec-warn{padding:8px 10px;border-radius:8px;font-size:10px;
+      background:rgba(230,127,78,.14);border:1px solid rgba(230,127,78,.36);color:#ffd0b6}
+    .exec-warn b{color:#ffd9c4}
+
     body.draw #map,body.uturn #map{cursor:crosshair}
     .leaflet-container{background:#e9e4da}
     .leaflet-control-attribution{background:rgba(255,255,255,.8)!important;font-size:9px!important}
@@ -276,6 +387,12 @@ HTML = r"""<!doctype html>
         <span class="pill" id="livePill">LIVE</span>
       </div>
 
+      <div class="modetabs">
+        <button class="modetab on" data-app="plan" type="button">&#9998;&nbsp; Plan</button>
+        <button class="modetab" data-app="execute" type="button">&#9654;&nbsp; Execute</button>
+      </div>
+
+      <section class="appview" id="view-plan">
       <div class="filebar">
         <div class="file-row">
           <select id="target" title="Route file being edited">
@@ -294,6 +411,11 @@ HTML = r"""<!doctype html>
             <input type="checkbox" id="autosave"> Auto
           </label>
         </div>
+      </div>
+
+      <div class="tools">
+        <button class="tool on" data-mode="select" type="button"><b>Select</b><kbd>V</kbd></button>
+        <button class="tool" data-mode="draw" type="button"><b>Draw</b><kbd>D</kbd></button>
       </div>
 
       <div class="scroll">
@@ -342,17 +464,14 @@ HTML = r"""<!doctype html>
             <label>Arc angle</label>
             <div class="presets">
               <button class="btn preset" data-angle="45" type="button">45&deg;</button>
-              <button class="btn preset" data-angle="90" type="button">90&deg;</button>
-              <button class="btn preset on" data-angle="180" type="button">180&deg;</button>
-              <input id="turnAngle" type="number" min="5" max="180" step="5" value="180">
+              <button class="btn preset on" data-angle="90" type="button">90&deg;</button>
+              <button class="btn preset" data-angle="180" type="button">180&deg;</button>
+              <input id="turnAngle" type="number" min="5" max="180" step="5" value="90">
             </div>
             <div class="r3">
-              <label>Radius m <input id="uturnRadius" type="number" min="0.5" max="500" step="0.5" value="6"></label>
+              <label>Radius m <input id="uturnRadius" type="number" min="0.5" max="500" step="0.5" value="12"></label>
               <label>Side
-                <select id="uturnSide">
-                  <option value="left">Left</option>
-                  <option value="right">Right</option>
-                </select>
+                <button type="button" id="uturnSide" class="sidetoggle" data-side="left">Left &#8592;</button>
               </label>
               <label>Pts/180&deg; <input id="uturnPoints" type="number" min="6" max="96" step="1" value="18"></label>
             </div>
@@ -361,7 +480,9 @@ HTML = r"""<!doctype html>
             </label>
             <div id="turnStats" class="status">--</div>
             <button id="insertUturnBtn" class="btn wide">Insert at selection</button>
-            <p class="hint">Or hit <kbd>U</kbd> and click the map to drop the turn there.
+            <p class="hint">The ghost turn always trails the working point. <kbd>U</kbd> cycles it
+              left&nbsp;/&nbsp;right&nbsp;/&nbsp;straight (or <kbd>L</kbd>/<kbd>R</kbd>/<kbd>S</kbd>);
+              clicking drops points, <kbd>I</kbd> inserts the turn.
               <b>Continue</b> runs a straight leg on after the arc, so the turn joins the next swath
               instead of dead-ending.</p>
           </div>
@@ -396,20 +517,66 @@ HTML = r"""<!doctype html>
           </div>
         </details>
       </div>
+      </section>
+
+      <section class="appview" id="view-execute" hidden>
+        <div class="scroll">
+          <div class="exec-file">
+            <div class="exec-file-row">
+              <span class="exec-label">Streaming file</span>
+              <b id="execFile">line.geojson</b>
+            </div>
+            <div id="execDirty" class="exec-warn" hidden>Unsaved edits in <b>Plan</b> — save first; the machine streams the file on disk.</div>
+          </div>
+          <div class="card stream" id="cardStream">
+            <div class="card-head">Stream to machine <span class="count" id="streamPhase">idle</span></div>
+            <div class="card-body">
+              <button id="playBtn" class="play">&#9654;&nbsp; Play</button>
+              <div class="r3">
+                <label>Window <input id="pWindow" type="number" min="1" max="2000" step="10" value="200"></label>
+                <label>Trigger % <input id="pTrigger" type="number" min="1" max="100" step="5" value="70"></label>
+                <label>Overlap <input id="pOverlap" type="number" min="0" max="500" step="1" value="3"></label>
+              </div>
+              <div class="r3">
+                <label>Spacing m <input id="pSpacing" type="number" min="0.05" max="10" step="0.1" value="1.0"></label>
+                <label>Ahead <input id="pAhead" type="number" min="1" max="5" step="1" value="5"></label>
+                <label>Back <input id="pBack" type="number" min="0" max="100" step="1" value="6"></label>
+              </div>
+              <label class="chk"><input type="checkbox" id="pNoGate"> Skip inside-field gate</label>
+              <div class="readout" id="streamReadout">
+                <div><span>Progress</span><b id="sProgress">--</b></div>
+                <div><span>Sent</span><b id="sSentUntil">--</b></div>
+                <div><span>Next trigger</span><b id="sTrigger">--</b></div>
+                <div><span>Overlap (re-sent)</span><b id="sOverlap">--</b></div>
+                <div><span>Batches</span><b id="sBatches">--</b></div>
+                <div><span>Frames</span><b id="sFrames">--</b></div>
+              </div>
+              <div id="streamGates" class="gates">
+                <span data-gate="ppp">PPP</span><span data-gate="allowed">ALLOWED</span>
+                <span data-gate="inside">INSIDE</span><span data-gate="run">RUN</span>
+                <span data-gate="engaged">ENGAGED</span>
+              </div>
+              <div id="streamStatus" class="status">Idle — press Play to stream this route to the machine.</div>
+              <pre id="streamLog" class="log"></pre>
+            </div>
+          </div>
+        </div>
+      </section>
     </aside>
 
     <main id="map">
-      <div class="modeswitch">
-        <div class="seg">
-          <button class="tool on" data-mode="select" type="button">Select <kbd>V</kbd></button>
-          <button class="tool" data-mode="draw" type="button">Draw <kbd>D</kbd></button>
-        </div>
-      </div>
       <div class="maptools">
         <div class="seg">
           <button id="mapLightBtn" class="on" type="button">Light</button>
           <button id="mapSatelliteBtn" type="button">Satellite</button>
         </div>
+      </div>
+      <div id="legend" class="legend" hidden>
+        <span><i class="sw done"></i>done</span>
+        <span><i class="sw sent"></i>on display</span>
+        <span><i class="sw overlap"></i>overlap (re-sent)</span>
+        <span><i class="sw pending"></i>not sent</span>
+        <span><i class="sw trig"></i>trigger</span>
       </div>
       <div id="toasts" class="toasts"></div>
       <div id="hintbar" class="hintbar"></div>
@@ -437,9 +604,9 @@ HTML = r"""<!doctype html>
 
     const FILE_NAMES = { line: "line.geojson", uturn: "u_field.geojson" };
     const HINTS = {
-      select: "<b>Select</b> drag a point &middot; click the line to insert &middot; <kbd>Del</kbd> remove &middot; arrows nudge &middot; <kbd>U</kbd> turn tool",
-      draw: "<b>Draw</b> click the map to append a point &middot; <kbd>Esc</kbd> done",
-      uturn: "<b>Turn armed</b> click the map to drop the arc &middot; <kbd>Enter</kbd> at selection &middot; <kbd>Esc</kbd> or close the card to stop"
+      select: "<b>Select</b> drag a point &middot; drag the line to move all &middot; click line to insert &middot; <kbd>U</kbd> turn L/R/straight &middot; <kbd>I</kbd> drop turn",
+      draw: "<b>Draw</b> click to append a point &middot; <kbd>U</kbd> ghost L/R/straight &middot; <kbd>I</kbd> drop turn &middot; <kbd>Esc</kbd> done",
+      uturn: "<b>Turn armed</b> click to drop a point (ghost follows) &middot; <kbd>U</kbd> cycles L/R/straight &middot; <kbd>I</kbd> insert &middot; <kbd>Esc</kbd> stop"
     };
 
     const route = [];
@@ -467,6 +634,31 @@ HTML = r"""<!doctype html>
       html: "<div class='machine'><div class='arrow'></div><div class='mlabel'>MACHINE</div></div>" });
     const machineMarker = L.marker([0, 0], { icon: machineIcon, zIndexOffset: 1000 });
 
+    // ---- streaming layers. Drawn only while playing, removed on stop. -------
+    // Strong, saturated colours so they read on both the light and satellite basemaps.
+    // Order matters: overlap sits UNDER sent so the amber halo reads as a highlight of
+    // the re-sent tail rather than a separate line.
+    const xBase    = L.polyline([], { color: "#31424b", weight: 3, opacity: .6, interactive: false });
+    const xPending = L.polyline([], { color: "#9aa7ad", weight: 4, opacity: .8, dashArray: "3 7", interactive: false });
+    const xOverlap = L.polyline([], { color: "#ffb020", weight: 15, opacity: .55, lineCap: "round", interactive: false });
+    const xSent    = L.polyline([], { color: "#12b5d8", weight: 6, opacity: 1, lineCap: "round", interactive: false });
+    const xDone    = L.polyline([], { color: "#1fd06a", weight: 6, opacity: 1, lineCap: "round", interactive: false });
+    const xDots    = L.layerGroup();
+    const xTrigger = L.circleMarker([0, 0], { radius: 9, color: "#ff6a2b", weight: 4, fill: true,
+                                              fillColor: "#ff6a2b", fillOpacity: .25, interactive: false });
+    const xHead    = L.circleMarker([0, 0], { radius: 8, color: "#ffffff", weight: 3, fillColor: "#1fd06a",
+                                              fillOpacity: 1, interactive: false });
+    const STREAM_LAYERS = [xBase, xPending, xOverlap, xSent, xDone, xDots, xTrigger, xHead];
+    const MAX_DOTS = 6000;          // interpolated routes can be thousands of points
+    let streamPoints = [];          // [[lat, lon, headland], ...] from /stream/route
+    let streaming = false;
+    let streamTimer = null;
+    let markers = [];               // one draggable marker per route point, index-aligned
+    // Exact end-tangent of the last inserted segment, so chained turns/legs start
+    // from the true tangent (not the polyline's last chord, which drifts a few deg
+    // per turn and makes the outgoing straights fan apart). {lat, lon, heading}.
+    let lastInsert = null;
+
     const el = {};
     for (const id of ["apiUrl", "livePill", "pollBtn", "centerBtn", "mapLightBtn", "mapSatelliteBtn",
       "fitBtn", "insertUturnBtn", "uturnRadius", "uturnSide", "uturnPoints", "positionStatus",
@@ -475,7 +667,11 @@ HTML = r"""<!doctype html>
       "target", "saveBtn", "saveLabel", "autosave", "undoBtn", "redoBtn", "revertBtn", "importBtn",
       "copyBtn", "downloadBtn", "formatBtn", "geojsonText", "toasts", "hintbar", "fileSummary",
       "selCount", "listCount", "machineCount", "cardPoints", "cardJson", "cardUturn",
-      "turnAngle", "turnContinue", "turnStats", "turnCount"]) {
+      "turnAngle", "turnContinue", "turnStats", "turnCount",
+      "cardStream", "playBtn", "streamPhase", "streamStatus", "streamLog", "streamGates",
+      "legend", "pWindow", "pTrigger", "pOverlap", "pSpacing", "pAhead", "pBack", "pNoGate",
+      "sProgress", "sSentUntil", "sTrigger", "sOverlap", "sBatches", "sFrames",
+      "execFile", "execDirty"]) {
       el[id] = document.getElementById(id);
     }
 
@@ -599,6 +795,9 @@ HTML = r"""<!doctype html>
 
     // ----------------------------------------------------------------- u-turn
     function headingForUturn(start, explicitIndex) {
+      // If the working point is still the exact end of the last inserted segment,
+      // chain off its true tangent instead of the drifting last chord.
+      if (lastInsert && start && meters(start, [lastInsert.lat, lastInsert.lon]) < 0.05) return lastInsert.heading;
       const index = explicitIndex === undefined ? selectedIndex : explicitIndex;
       let heading = null;
       if (index !== null && route[index]) {
@@ -645,13 +844,22 @@ HTML = r"""<!doctype html>
     // The turn = arc, then optionally a straight leg so it joins the next swath
     // instead of dead-ending in mid-field.
     function buildUturn(start, headingDeg) {
-      const radius = clampNumber(el.uturnRadius.value, 0.5, 500, 6);
-      const angle = clampNumber(el.turnAngle.value, 5, 180, 180);
+      const radius = clampNumber(el.uturnRadius.value, 0.5, 500, 12);
+      const angle = clampNumber(el.turnAngle.value, 5, 180, 90);
       const per180 = Math.round(clampNumber(el.uturnPoints.value, 6, 96, 18));
       const runOn = clampNumber(el.turnContinue.value, 0, 5000, 0);
-      const right = el.uturnSide.value === "right";
-
+      const side = el.uturnSide.dataset.side;      // "left" | "right" | "straight"
       const steps = Math.max(3, Math.round(per180 * angle / 180));
+
+      // Straight: a dead-ahead leg the SAME total length the curve would have had
+      // (arc path length + run-on), so you can preview/lay a straight continuation.
+      if (side === "straight") {
+        const arcLen = radius * angle * Math.PI / 180;
+        const legSteps = runOn > 0 ? Math.max(1, Math.round(runOn / Math.max(0.3, Math.PI * radius / per180))) : 0;
+        return { pts: straightSegment(start, headingDeg, arcLen + runOn, steps + legSteps).pts, endHeading: norm360(headingDeg) };
+      }
+
+      const right = side === "right";
       const arc = arcSegment(start, headingDeg, radius, right, angle, steps);
       let pts = arc.pts;
       if (runOn > 0) {
@@ -659,7 +867,7 @@ HTML = r"""<!doctype html>
         const legSteps = Math.max(1, Math.round(runOn / Math.max(0.3, spacing)));
         pts = pts.concat(straightSegment(arc.end, arc.heading, runOn, legSteps).pts.slice(1));
       }
-      return pts;
+      return { pts, endHeading: arc.heading };   // arc.heading = exact end tangent
     }
 
     // Spacing and per-segment heading change decide whether the Display will actually
@@ -699,10 +907,11 @@ HTML = r"""<!doctype html>
           "<br>gap " + q.maxGap.toFixed(2) + " m &middot; " + q.maxTurn.toFixed(0) + " deg/seg";
     }
 
-    // Preview whenever the Turn card is open, not only while the tool is armed —
-    // you want to see the arc while you are dialling the radius in.
+    // The turn ghost is ALWAYS on while editing: it trails the working point so you
+    // can always see where a left / right / straight continuation would land. It is
+    // hidden only in the Execute view (or mid-stream), where the route is read-only.
     function previewUturn() {
-      if (mode !== "uturn" && !el.cardUturn.open) {
+      if (appMode === "execute" || streaming) {
         uturnPreview.setLatLngs([]);
         setTurnStats(null);
         return;
@@ -712,7 +921,7 @@ HTML = r"""<!doctype html>
       else if (currentPosition) start = currentPosition;
       else if (route.length) { start = route[route.length - 1]; index = route.length - 1; }
       if (!start) { uturnPreview.setLatLngs([]); setTurnStats(null); return; }
-      const pts = buildUturn(start, headingForUturn(start, index));
+      const pts = buildUturn(start, headingForUturn(start, index)).pts;
       uturnPreview.setLatLngs(pts);
       setTurnStats(pts);
       toFront();
@@ -724,14 +933,18 @@ HTML = r"""<!doctype html>
       else if (!start && currentPosition) start = currentPosition;
       else if (!start && route.length) { start = route[route.length - 1]; index = route.length - 1; includeStart = false; }
       if (!start) { toast("No start point for the turn", "bad"); return; }
-      const arc = buildUturn(start, headingForUturn(start, index));
+      const built = buildUturn(start, headingForUturn(start, index));
+      const arc = built.pts;
       if (route.length && includeStart && meters(route[route.length - 1], start) < 0.3) includeStart = false;
       const points = includeStart ? arc : arc.slice(1);
       route.splice(insertAt, 0, ...points);
       selectedIndex = insertAt + points.length - 1;
+      // Remember this segment's exact end tangent so the next insert chains off it
+      // and the outgoing straights stay perfectly parallel.
+      lastInsert = { lat: route[selectedIndex][0], lon: route[selectedIndex][1], heading: built.endHeading };
       commit();
       const q = turnQuality(arc);
-      toast(Math.round(clampNumber(el.turnAngle.value, 5, 180, 180)) + "° turn inserted — " +
+      toast(Math.round(clampNumber(el.turnAngle.value, 5, 180, 90)) + "° turn inserted — " +
         points.length + " pts" + (q.maxTurn > 30 ? " (⚠ " + q.maxTurn.toFixed(0) + " deg/seg)" : ""),
         q.maxTurn > 30 ? "bad" : "ok");
     }
@@ -900,6 +1113,7 @@ HTML = r"""<!doctype html>
     }
     function renderMarkers() {
       pointLayer.clearLayers();
+      markers = [];
       route.forEach((point, index) => {
         const cls = ["h", index === 0 ? "first" : "", index === selectedIndex ? "on" : ""].filter(Boolean).join(" ");
         const marker = L.marker(point, {
@@ -924,6 +1138,7 @@ HTML = r"""<!doctype html>
           commit();
         });
         marker.addTo(pointLayer);
+        markers[index] = marker;
       });
     }
     function render() {
@@ -1036,6 +1251,252 @@ HTML = r"""<!doctype html>
       pollTimer = setTimeout(pollLoop, pollIntervalMs);
     }
 
+    // =====================================================================
+    // STREAMING
+    // =====================================================================
+    const PHASE_TEXT = {
+      idle: "Idle. Save the route first, then Play.",
+      arming: "Arming — sending ADJOB, waiting for the Display to return a DSAP anchor.",
+      streaming: "Streaming.",
+      done: "Route complete.",
+      stopped: "Stopped. Job stood down (ADJOB systemActive=false).",
+      error: "Error."
+    };
+
+    // Called only inside Execute mode. The interpolated preview (xBase/xPending/xDots)
+    // is already on the map; this only adds/removes the LIVE bands and locks the panel.
+    function setStreamingUI(on) {
+      streaming = on;
+      document.body.classList.toggle("streaming", on);
+      el.legend.hidden = !on;
+      el.playBtn.classList.toggle("stop", on);
+      el.playBtn.innerHTML = on ? "&#9632;&nbsp; Stop" : "&#9654;&nbsp; Play";
+      [el.pWindow, el.pTrigger, el.pOverlap, el.pSpacing, el.pAhead, el.pBack, el.pNoGate]
+        .forEach((i) => { i.disabled = on; });
+      // Can't leave Execute mid-run.
+      document.querySelectorAll(".modetab").forEach((b) => { if (b.dataset.app === "plan") b.disabled = on; });
+
+      if (on) {
+        [xOverlap, xSent, xDone, xTrigger, xHead].forEach((l) => l.addTo(map));
+      } else {
+        [xOverlap, xSent, xDone, xTrigger, xHead].forEach((l) => { if (map.hasLayer(l)) map.removeLayer(l); });
+        el.cardStream.classList.remove("live", "fault");
+        // Back to the clean preview: every point pending again.
+        if (streamPoints.length) xPending.setLatLngs(streamPoints.map((p) => [p[0], p[1]]));
+      }
+      toFront();
+    }
+
+    // The interpolated points that actually go on the wire — NOT the vertices you drew.
+    // Each is a visible dot with a dark ring so it reads on any basemap; headland pts orange.
+    function drawStreamDots(points) {
+      streamPoints = points;
+      xBase.setLatLngs(points.map((p) => [p[0], p[1]]));
+      xDots.clearLayers();
+      if (points.length > MAX_DOTS) {
+        toast(points.length + " interpolated pts — dots hidden above " + MAX_DOTS);
+      } else {
+        points.forEach((p) => {
+          L.circleMarker([p[0], p[1]], {
+            radius: p[2] ? 4 : 3, interactive: false,
+            color: "#0d1418", weight: 1.2,                 // dark ring = visible on light + satellite
+            fillColor: p[2] ? "#ff8a3d" : "#eaf4f8", fillOpacity: 1
+          }).addTo(xDots);
+        });
+      }
+      const b = L.latLngBounds(points.map((p) => [p[0], p[1]]));
+      map.fitBounds(b, { padding: [50, 50], maxZoom: 20, animate: false });
+    }
+
+    async function fetchStreamRoute() {
+      const res = await fetch("/stream/route", { cache: "no-store" });
+      const body = await res.json();
+      if (!body.points || !body.points.length) return false;
+      drawStreamDots(body.points);
+      return true;
+    }
+
+    // Preview: what WILL be streamed, straight from the file, before you press Play.
+    // This is what makes the interpolated points visible the moment you enter Execute.
+    async function fetchPreview() {
+      const q = "?route=" + encodeURIComponent(el.target.value) +
+                "&spacing=" + encodeURIComponent(Number(el.pSpacing.value) || 1.0);
+      const res = await fetch("/stream/preview" + q, { cache: "no-store" });
+      const body = await res.json();
+      if (!res.ok) { toast(body.error || "Preview failed", "bad"); return false; }
+      drawStreamDots(body.points);
+      xDone.setLatLngs([]); xSent.setLatLngs([]); xOverlap.setLatLngs([]);
+      xPending.setLatLngs(body.points.map((p) => [p[0], p[1]]));   // all pending until Play
+      if (map.hasLayer(xTrigger)) map.removeLayer(xTrigger);
+      if (map.hasLayer(xHead)) map.removeLayer(xHead);
+      toast(body.points.length + " interpolated pts @ " + Number(el.pSpacing.value).toFixed(2) + " m", "ok");
+      return true;
+    }
+
+    function renderStreamLayers(st) {
+      const P = streamPoints;
+      const n = P.length;
+      if (n < 2) return;
+      const clamp = (i) => Math.max(0, Math.min(n - 1, i));
+      const seg = (i, j) => {
+        const from = clamp(i), to = clamp(j);
+        return to <= from ? [] : P.slice(from, to + 1).map((p) => [p[0], p[1]]);
+      };
+      const prog = clamp(st.progress);
+      const sentUntil = clamp(st.sent_until - 1);
+      const winEnd = clamp(st.window_end - 1);
+      const nextStart = clamp(st.next_window_start);
+
+      xDone.setLatLngs(seg(0, prog));                      // machine has driven these
+      xSent.setLatLngs(seg(prog, sentUntil));              // on the Display, ahead of the machine
+      // Amber = [next batch start .. current window end]: the points the next batch re-sends
+      // (send_points.py's overlap region). Sits under the teal so it reads as a highlight.
+      xOverlap.setLatLngs(st.phase === "streaming" && st.overlap_count > 0 ? seg(nextStart, winEnd) : []);
+      xPending.setLatLngs(seg(sentUntil, n - 1));          // never streamed yet
+      xHead.setLatLng(P[prog]);
+      if (!map.hasLayer(xHead)) xHead.addTo(map);
+      if (st.phase === "streaming" && st.window_end < n) {
+        xTrigger.setLatLng(P[clamp(st.trigger_index)]);
+        if (!map.hasLayer(xTrigger)) xTrigger.addTo(map);
+      } else if (map.hasLayer(xTrigger)) {
+        map.removeLayer(xTrigger);
+      }
+      toFront();
+    }
+
+    function renderStreamPanel(st) {
+      const live = st.phase === "streaming" || st.phase === "arming";
+      const fault = st.phase === "error";
+      el.cardStream.classList.toggle("live", live);
+      el.cardStream.classList.toggle("fault", fault);
+      el.streamPhase.textContent = st.phase;
+      el.streamStatus.className = "status" + (fault ? " bad" : (st.phase === "streaming" ? " ok" : ""));
+      el.streamStatus.textContent = (PHASE_TEXT[st.phase] || st.phase) + (st.message && fault ? " " + st.message : "");
+
+      const n = st.total || 0;
+      el.sProgress.textContent = n ? st.progress + " / " + (n - 1) : "--";
+      el.sSentUntil.textContent = n ? st.sent_until + " / " + n : "--";
+      el.sTrigger.textContent = st.phase === "streaming"
+        ? (st.window_end < n ? String(st.trigger_index) : "done") : "--";
+      el.sOverlap.textContent = st.phase === "streaming" ? st.overlap_count + " pts" : "--";
+      el.sBatches.textContent = String(st.batches);
+      el.sFrames.textContent = String(st.frames);
+
+      const gates = { ppp: st.ppp, allowed: st.allowed, inside: st.inside || el.pNoGate.checked,
+                      run: st.run_command, engaged: st.engaged };
+      el.streamGates.querySelectorAll("[data-gate]").forEach((g) => {
+        g.classList.toggle("on", Boolean(gates[g.dataset.gate]));
+      });
+      if (st.reject) {
+        el.streamGates.querySelector('[data-gate="engaged"]').classList.add("warn");
+      }
+      el.streamLog.textContent = (st.log || []).slice(-14).join("\n");
+      el.streamLog.scrollTop = el.streamLog.scrollHeight;
+    }
+
+    async function streamPoll() {
+      try {
+        const res = await fetch("/stream/state", { cache: "no-store" });
+        const st = await res.json();
+        if (!streamPoints.length) await fetchStreamRoute();
+        renderStreamPanel(st);
+        if (streamPoints.length) renderStreamLayers(st);
+
+        if (st.phase === "done" || st.phase === "stopped" || st.phase === "error") {
+          clearTimeout(streamTimer);
+          streamTimer = null;
+          const kind = st.phase === "error" ? "bad" : "ok";
+          toast(st.phase === "done" ? "Route complete" :
+                st.phase === "error" ? "Stream error: " + st.message : "Stream stopped", kind);
+          // Leave the final picture up for a beat, then hand the editor back.
+          setTimeout(() => { if (!streaming) return; setStreamingUI(false); }, 2500);
+          return;
+        }
+      } catch (err) {
+        toast("Stream poll failed: " + err.message, "bad");
+      }
+      streamTimer = setTimeout(streamPoll, 200);
+    }
+
+    async function startStream() {
+      if (isDirty()) { toast("Save the route before streaming it", "bad"); return; }
+      if (route.length < 2) { toast("Nothing to stream", "bad"); return; }
+      const target = el.target.value;
+      const bus = el.cardStream.dataset.canBus || "?";
+      if (!confirm(
+        "Stream " + FILE_NAMES[target] + " to the machine on " + bus + "?\n\n" +
+        "This transmits on the CAN bus. Once enough points are on the Display, RunCommand " +
+        "goes high and AutoDrive takes over the STEERING.\n\n" +
+        "Area clear? Hand on the e-stop?")) return;
+
+      const body = {
+        route: target,
+        window_size: Number(el.pWindow.value),
+        trigger_fraction: Number(el.pTrigger.value) / 100,
+        overlap_offset: Number(el.pOverlap.value),
+        max_spacing: Number(el.pSpacing.value),
+        nearest_ahead: Number(el.pAhead.value),
+        nearest_backtrack: Number(el.pBack.value),
+        no_inside_gate: el.pNoGate.checked,
+      };
+      try {
+        const res = await fetch("/stream/start", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const out = await res.json();
+        if (!res.ok) { toast(out.error || "Start failed", "bad"); return; }
+        setStreamingUI(true);
+        toast("Streaming " + FILE_NAMES[target], "ok");
+        streamPoll();
+      } catch (err) {
+        toast("Start failed: " + err.message, "bad");
+      }
+    }
+
+    async function stopStream() {
+      try {
+        await fetch("/stream/stop", { method: "POST" });
+        toast("Stopping — standing the job down");
+      } catch (err) {
+        toast("Stop failed: " + err.message, "bad");
+      }
+    }
+
+    el.playBtn.onclick = () => (streaming ? stopStream() : startStream());
+
+    // ---- top-level Plan / Execute -------------------------------------------
+    let appMode = "plan";
+    function setAppMode(next) {
+      if (next === appMode) return;
+      if (appMode === "execute" && streaming) { toast("Stop the stream before leaving Execute", "bad"); return; }
+      if (next === "execute" && isDirty()) { el.execDirty.hidden = false; }
+      appMode = next;
+      document.querySelectorAll(".modetab").forEach((b) => b.classList.toggle("on", b.dataset.app === appMode));
+      document.getElementById("view-plan").hidden = appMode !== "plan";
+      document.getElementById("view-execute").hidden = appMode !== "execute";
+      document.body.classList.toggle("exec-mode", appMode === "execute");
+
+      if (appMode === "execute") {
+        // Show the interpolated points that WILL stream, straight away.
+        el.execFile.textContent = FILE_NAMES[el.target.value];
+        el.execDirty.hidden = !isDirty();
+        map.removeLayer(pointLayer);
+        routeLayer.setStyle({ opacity: .12 }); casing.setStyle({ opacity: .12 });
+        [xBase, xPending, xDots].forEach((l) => l.addTo(map));
+        fetchPreview().catch((err) => toast("Preview failed: " + err.message, "bad"));
+      } else {
+        STREAM_LAYERS.forEach((l) => { if (map.hasLayer(l)) map.removeLayer(l); });
+        xDots.clearLayers(); streamPoints = [];
+        if (!map.hasLayer(pointLayer)) pointLayer.addTo(map);
+        routeLayer.setStyle({ opacity: .97 }); casing.setStyle({ opacity: .9 });
+        el.hintbar.innerHTML = HINTS[mode];
+        render();
+      }
+      setTimeout(() => map.invalidateSize(true), 50);
+    }
+    document.querySelectorAll(".modetab").forEach((b) => b.addEventListener("click", () => setAppMode(b.dataset.app)));
+    // Re-preview when the spacing that drives interpolation changes, while in Execute.
+    el.pSpacing.addEventListener("change", () => { if (appMode === "execute" && !streaming) fetchPreview().catch(() => {}); });
+
     // ----------------------------------------------------------------- wiring
     // Picking Select or Draw disarms the Turn tool by closing its card.
     document.querySelectorAll(".tool").forEach((b) => b.addEventListener("click", () => {
@@ -1046,19 +1507,68 @@ HTML = r"""<!doctype html>
     el.cardJson.addEventListener("toggle", renderJSON);
 
     map.on("click", (ev) => {
+      if (streaming) return;                 // read-only while the machine is driving this route
       if (mode === "draw") { appendPoint(ev.latlng); return; }
-      if (mode === "uturn") { insertUturn([ev.latlng.lat, ev.latlng.lng]); return; }
+      // Turn tool armed: a plain click just drops a normal point (and the ghost
+      // arc follows it). The arc is only committed when you press I / Enter.
+      if (mode === "uturn") { appendPoint(ev.latlng); return; }
       selectPoint(null);
     });
+    // Click on the line inserts a point; press-and-drag on the line moves the
+    // whole route. We start a drag on mousedown and only treat it as a move once
+    // the pointer travels past a small threshold, so a plain click still inserts.
+    let routeDrag = null;
+    function onRouteDragMove(ev) {
+      if (!routeDrag) return;
+      const dLat = ev.latlng.lat - routeDrag.origin.lat;
+      const dLng = ev.latlng.lng - routeDrag.origin.lng;
+      if (!routeDrag.moved) {
+        const px = map.latLngToLayerPoint(ev.latlng).distanceTo(routeDrag.originPx);
+        if (px < 4) return;                  // ignore sub-4px jitter: this is still a click
+        routeDrag.moved = true;
+      }
+      for (let i = 0; i < route.length; i++) {
+        route[i] = [routeDrag.base[i][0] + dLat, routeDrag.base[i][1] + dLng];
+        if (markers[i]) markers[i].setLatLng(route[i]);
+      }
+      casing.setLatLngs(route);
+      routeLayer.setLatLngs(route);
+      previewUturn();
+    }
+    function onRouteDragEnd() {
+      if (!routeDrag) return;
+      const moved = routeDrag.moved;
+      routeDrag = null;
+      map.off("mousemove", onRouteDragMove);
+      map.off("mouseup", onRouteDragEnd);
+      map.dragging.enable();
+      if (moved) { suppressLineClick = true; commit(); }
+    }
+    let suppressLineClick = false;
+    routeLayer.on("mousedown", (ev) => {
+      if (streaming || mode !== "select") return;
+      L.DomEvent.stop(ev);                    // don't let the map start its own drag/pan
+      routeDrag = {
+        origin: ev.latlng,
+        originPx: map.latLngToLayerPoint(ev.latlng),
+        base: route.map((p) => [p[0], p[1]]),
+        moved: false,
+      };
+      map.dragging.disable();
+      map.on("mousemove", onRouteDragMove);
+      map.on("mouseup", onRouteDragEnd);
+    });
     routeLayer.on("click", (ev) => {
-      if (mode !== "select") return;
+      if (streaming || mode !== "select") return;
       L.DomEvent.stopPropagation(ev);
+      if (suppressLineClick) { suppressLineClick = false; return; }  // this "click" ended a drag
       insertOnSegment(ev.latlng);
     });
 
     document.addEventListener("keydown", (ev) => {
       const meta = ev.ctrlKey || ev.metaKey;
       const key = ev.key;
+      if (streaming) return;                 // no edit shortcuts mid-run
       if (meta && key.toLowerCase() === "s") { ev.preventDefault(); save(false); return; }
       if (meta && key.toLowerCase() === "z") { ev.preventDefault(); if (ev.shiftKey) redo(); else undo(); return; }
       if (meta && key.toLowerCase() === "y") { ev.preventDefault(); redo(); return; }
@@ -1068,9 +1578,16 @@ HTML = r"""<!doctype html>
       if (key === "Delete" || key === "Backspace") { ev.preventDefault(); deleteSelected(); return; }
       if (key === "v" || key === "V") { el.cardUturn.open = false; setMode("select"); return; }
       if (key === "d" || key === "D") { el.cardUturn.open = false; setMode("draw"); return; }
-      // U opens the Turn card, which is what arms the tool.
-      if (key === "u" || key === "U") { el.cardUturn.open = true; setMode("uturn"); return; }
+      // The turn ghost is always on. U cycles its type (left -> right -> straight);
+      // L / R / S set it directly. These work in any edit mode.
+      if (key === "u" || key === "U") { setTurnSide(); return; }
+      if (key === "l" || key === "L") { setTurnSide("left"); return; }
+      if (key === "r" || key === "R") { setTurnSide("right"); return; }
+      if (key === "s" || key === "S") { setTurnSide("straight"); return; }
       if (key === "f" || key === "F") { fitAll(); return; }
+      // I (insert) commits the ghost into the route at the working point; Enter does
+      // the same while the Turn card/tool is armed.
+      if (key === "i" || key === "I") { insertUturn(); return; }
       if (key === "Enter" && mode === "uturn") { insertUturn(); return; }
       if (key.indexOf("Arrow") === 0) { ev.preventDefault(); nudge(key, ev.shiftKey); }
     });
@@ -1109,7 +1626,24 @@ HTML = r"""<!doctype html>
     el.fitBtn.onclick = fitAll;
     el.insertUturnBtn.onclick = () => insertUturn();
     el.uturnRadius.oninput = previewUturn;
-    el.uturnSide.onchange = previewUturn;
+    // Side toggle: cycling always passes through straight in the middle —
+    // left -> straight -> right -> straight -> left -> ... Pass a value to set it
+    // directly (L/R/S), or no argument to advance the cycle (button click / U key).
+    const SIDE_CYCLE = ["left", "straight", "right", "straight"];
+    const SIDE_LABEL = { left: "Left &#8592;", right: "Right &#8594;", straight: "Straight" };
+    let sideCycleIdx = 0;
+    function setTurnSide(side) {
+      if (side) {
+        el.uturnSide.dataset.side = side;
+        sideCycleIdx = SIDE_CYCLE.indexOf(side);      // resync so the next U continues the cycle
+      } else {
+        sideCycleIdx = (sideCycleIdx + 1) % SIDE_CYCLE.length;
+        el.uturnSide.dataset.side = SIDE_CYCLE[sideCycleIdx];
+      }
+      el.uturnSide.innerHTML = SIDE_LABEL[el.uturnSide.dataset.side];
+      previewUturn();
+    }
+    el.uturnSide.onclick = () => setTurnSide();
     el.uturnPoints.oninput = previewUturn;
     el.turnContinue.oninput = previewUturn;
     // Opening the Turn card IS the Turn tool. Closing it hands you back to Select.
@@ -1195,6 +1729,18 @@ HTML = r"""<!doctype html>
     resetHistory();
     render();
     loadTarget(el.target.value, true).catch(() => {});
+    // Pick up the CAN bus name, and re-attach to a stream already in flight (so a
+    // browser refresh mid-run does not orphan the machine behind a dead UI).
+    fetch("/stream/state", { cache: "no-store" }).then((r) => r.json()).then((st) => {
+      el.cardStream.dataset.canBus = st.can_bus;
+      el.streamPhase.textContent = st.phase;
+      if (st.phase === "arming" || st.phase === "streaming") {
+        setAppMode("execute");          // jump straight to the Execute tab...
+        setStreamingUI(true);           // ...already live
+        toast("Re-attached to a stream already running on " + st.can_bus, "ok");
+        streamPoll();
+      }
+    }).catch(() => {});
     // center=false: the machine must not yank the view away from the route you opened.
     pollOnce(false)
       .catch((err) => { setStatus("API read failed: " + err.message, "bad"); el.machineCount.textContent = "offline"; })
@@ -1205,8 +1751,283 @@ HTML = r"""<!doctype html>
 """
 
 
+# =============================================================================
+# STREAMING CONTROLLER
+#
+# Runs send_points.py's loop on a worker thread and publishes a snapshot the
+# browser can poll. Every protocol decision (window, trigger, overlap, progress
+# estimate, ADJOB) is send_points.py's — this only sequences it and reports.
+# =============================================================================
+
+class StreamController:
+
+    def __init__(self, can_bus: str):
+        self.can_bus = can_bus
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.points: list[list[float]] = []      # interpolated route as [lat, lon, headland]
+        self._reset()
+
+    # -- state -----------------------------------------------------------
+    def _reset(self) -> None:
+        with self.lock:
+            self.state = {
+                "phase": "idle",          # idle | arming | streaming | done | stopped | error
+                "message": "",
+                "route": None,
+                "can_bus": self.can_bus,
+                "anchor": None,
+                "total": 0,
+                "progress": 0,
+                "window_start": 0,
+                "window_end": 0,
+                "next_window_start": 0,
+                "trigger_index": 0,
+                "overlap_count": 0,
+                "sent_until": 0,
+                "batches": 0,
+                "frames": 0,
+                "active": False,
+                "run_command": False,
+                "engaged": False,
+                "reject": 0,
+                "speed_kph": 0.0,
+                "ppp": False,
+                "allowed": False,
+                "inside": False,
+                "elapsed_s": 0.0,
+                "log": [],
+            }
+
+    def _set(self, **kw) -> None:
+        with self.lock:
+            self.state.update(kw)
+
+    def _log(self, msg: str) -> None:
+        line = f"{time.strftime('%H:%M:%S')}  {msg}"
+        print(line, file=sys.stderr)
+        with self.lock:
+            self.state["log"] = (self.state["log"] + [line])[-60:]
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return dict(self.state)
+
+    def route_points(self) -> list[list[float]]:
+        with self.lock:
+            return list(self.points)
+
+    def running(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    # -- control ---------------------------------------------------------
+    def start(self, params: dict) -> None:
+        if self.running():
+            raise ValueError("already streaming")
+        self._reset()
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, args=(params,), daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    # -- the loop --------------------------------------------------------
+    def _run(self, p: dict) -> None:
+        bus = None
+        try:
+            route_name = p["route"]
+            spacing = float(p["max_spacing"])
+            window_size = int(p["window_size"])
+            trigger_fraction = float(p["trigger_fraction"])
+            overlap_offset = int(p["overlap_offset"])   # send_points.py's --overlap-from-trigger-offset
+            nearest_ahead = int(p["nearest_ahead"])
+            nearest_backtrack = int(p["nearest_backtrack"])
+            no_inside_gate = bool(p["no_inside_gate"])
+            timeout_s = float(p["timeout"])
+
+            # Geometry first, so the UI can draw the interpolated route while we
+            # are still waiting for an anchor. lat/lon do not depend on the datum.
+            path, gate_route, datum_lat, datum_lon = sp.route_for_max_spacing(route_name, spacing)
+            total = len(gate_route)
+            if total > a.PROTOCOL_U16_MAX:
+                raise ValueError(f"{total} points after interpolation; protocol max is {a.PROTOCOL_U16_MAX}")
+            pts = []
+            for rp in gate_route:
+                lat, lon = a.enu_to_wgs_approx(rp.x, rp.y, datum_lat, datum_lon)
+                pts.append([lat, lon, 1 if rp.is_headland else 0])
+            with self.lock:
+                self.points = pts
+
+            field = routes.bounding_field(gate_route, sp.FIELD_MARGIN_M)
+            job_id = p.get("job_id") or int(time.time()) % (a.PROTOCOL_U16_MAX + 1)
+            max_spacing = sp.max_route_spacing(gate_route)
+
+            self._set(phase="arming", route=route_name, total=total)
+            self._log(f"{route_name}: {total} pts, max spacing {max_spacing:.2f} m, "
+                      f"window={window_size}, trigger={trigger_fraction:.0%}, "
+                      f"overlap_offset={overlap_offset}, job_id={job_id}")
+            if max_spacing < sp.MIN_SPACING_M:
+                self._log(f"note: {max_spacing:.2f} m spacing is below the AgJunction {sp.MIN_SPACING_M} m minimum")
+
+            bus = a.make_bus(self.can_bus)
+            status = a.MachineStatus()
+
+            # ---- arming: ADJOB systemActive until the Display gives us an anchor
+            t0 = time.monotonic()
+            last_adjob = -999.0
+            active_sent = False
+            while not (active_sent and status.anchor_lat is not None):
+                if self.stop_event.is_set():
+                    self._finish("stopped", "stopped before anchor", bus, None, 0, 0, job_id)
+                    return
+                if time.monotonic() - t0 >= timeout_s:
+                    self._finish("error", f"no anchor within {timeout_s:.0f}s — check PPP / AutoDrive allowed / inside gate",
+                                 bus, None, 0, 0, job_id)
+                    return
+                frame = bus.recv(timeout=0.05)
+                if frame is not None:
+                    a.process_frame(frame, status)
+                inside = sp.inside_field(status, field, datum_lat, datum_lon)
+                active = status.gps_ppp_available and status.autodrive_allowed and (no_inside_gate or inside)
+                self._set(ppp=status.gps_ppp_available, allowed=status.autodrive_allowed,
+                          inside=inside, active=active, elapsed_s=time.monotonic() - t0,
+                          engaged=status.autodrive_engaged, reject=status.reject_reason,
+                          speed_kph=status.speed_kph)
+                now = time.monotonic() - t0
+                if now - last_adjob >= a.ADJOB_PERIOD_S:
+                    last_adjob = now
+                    if active and not active_sent:
+                        active_sent = True
+                        status.anchor_lat = None
+                        status.anchor_lon = None
+                        self._log("gates open — requesting job (ADJOB systemActive=true)")
+                    sp.send_adjob(bus, active, False, 0, total, job_id)
+
+            anchor_lat, anchor_lon = status.anchor_lat, status.anchor_lon
+            self._set(anchor=[anchor_lat, anchor_lon])
+            self._log(f"anchor {anchor_lat:.7f},{anchor_lon:.7f}")
+
+            # ---- re-resolve the route about the anchor, exactly as send_points does
+            route = sp.load_line_from_anchor(path, spacing, anchor_lat, anchor_lon)
+            waypoints = sp.build_waypoints(route)
+            xy = sp.route_xy(route)
+            n = len(waypoints)
+            self._set(total=n)
+
+            current_index = 0
+            window_start = window_end = sent_until = 0
+            batches = frames = 0
+            run_command = False
+
+            start, end, sent = sp.stream_next_window(bus, status, waypoints, 0, window_size)
+            batches += 1
+            frames += sent
+            window_start, window_end = start, end
+            sent_until = max(sent_until, end)
+            # send_points.py line 323, verbatim: latched once here and left as-is.
+            run_command = sent_until >= min(a.FUTURE_POINT_COUNT, n)
+            self._log(f"batch 1: sent [{start}..{end - 1}] ({sent} frames)")
+            self._set(phase="streaming", window_start=window_start, window_end=window_end,
+                      sent_until=sent_until, batches=batches, frames=frames, run_command=run_command)
+
+            # ---- run loop
+            last_report = -999.0
+            while current_index < n - 1:
+                if self.stop_event.is_set():
+                    self._finish("stopped", "stopped by operator", bus, status, current_index, n, job_id)
+                    return
+
+                frame = bus.recv(timeout=0.02)
+                if frame is not None:
+                    a.process_frame(frame, status)
+
+                inside = sp.inside_field(status, field, anchor_lat, anchor_lon)
+                active = status.gps_ppp_available and status.autodrive_allowed and (no_inside_gate or inside)
+                current_index = sp.estimate_progress_index(
+                    status, xy, anchor_lat, anchor_lon, current_index,
+                    nearest_backtrack, nearest_ahead,
+                )
+
+                # Exactly send_points.py's windowing (its lines 352-359): trigger at a
+                # fraction of the current window, next batch starts at trigger+offset.
+                window_len = max(1, window_end - window_start)
+                trigger_index = min(window_end - 1, window_start + math.floor(window_len * trigger_fraction))
+                next_start = min(window_end, trigger_index + overlap_offset)
+
+                if active and window_end < n and current_index >= trigger_index:
+                    start, end, sent = sp.stream_next_window(bus, status, waypoints, next_start, window_size)
+                    batches += 1
+                    frames += sent
+                    window_start, window_end = start, end
+                    previous = sent_until
+                    sent_until = max(sent_until, end)
+                    self._log(f"batch {batches}: progress {current_index} crossed trigger {trigger_index}; "
+                              f"sent [{start}..{end - 1}] ({sent} frames, new [{previous}..{sent_until - 1}])")
+
+                now = time.monotonic() - t0
+                if now - last_adjob >= a.ADJOB_PERIOD_S:
+                    last_adjob = now
+                    sp.send_adjob(bus, active, run_command, current_index, n, job_id)
+
+                if now - last_report >= 0.2:
+                    last_report = now
+                    self._set(
+                        progress=current_index, window_start=window_start, window_end=window_end,
+                        next_window_start=next_start, trigger_index=trigger_index,
+                        overlap_count=max(0, window_end - next_start),
+                        sent_until=sent_until, batches=batches, frames=frames,
+                        active=active, run_command=run_command,
+                        engaged=status.autodrive_engaged, reject=status.reject_reason,
+                        speed_kph=status.speed_kph, ppp=status.gps_ppp_available,
+                        allowed=status.autodrive_allowed, inside=inside, elapsed_s=now,
+                    )
+
+                if window_end >= n and current_index >= n - 1:
+                    break
+
+            self._finish("done", "route complete", bus, status, current_index, n, job_id)
+
+        except BaseException as exc:                       # noqa: BLE001 - surface anything to the UI
+            self._log(f"ERROR: {exc}")
+            self._set(phase="error", message=str(exc))
+            self._deactivate(bus, 0, 0, 0)
+
+    def _finish(self, phase, message, bus, status, current_index, total, job_id) -> None:
+        self._log(message)
+        self._deactivate(bus, current_index, total, job_id)
+        self._set(phase=phase, message=message, active=False, run_command=False,
+                  progress=current_index)
+
+    def _deactivate(self, bus, current_index: int, total: int, job_id: int) -> None:
+        """Hand the job back: ADJOB systemActive=false, RunCommand=false.
+
+        send_points.py just exits and leaves the last ADJOB standing; for a UI with
+        a Stop button that is not good enough, so we explicitly stand the job down.
+        """
+        if bus is None:
+            return
+        try:
+            for _ in range(3):
+                sp.send_adjob(bus, False, False, current_index, total, job_id)
+                time.sleep(0.05)
+            self._log("ADJOB systemActive=false sent (job stood down)")
+        except Exception as exc:                            # noqa: BLE001
+            self._log(f"deactivate failed: {exc}")
+        try:
+            bus.bus.shutdown()
+        except Exception:                                   # noqa: BLE001, S110
+            pass
+
+
+STREAM: StreamController | None = None
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Serve the AutoDrive route maker web UI.")
+    parser = argparse.ArgumentParser(description="Serve the AutoDrive route maker web UI (with live streaming).")
+    parser.add_argument("--can-bus", default=a.CAN_BUS,
+                        help=f"SocketCAN interface to stream on (default: {a.CAN_BUS}; vcan0 = bench)")
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"bind host (default: {DEFAULT_HOST})")
     parser.add_argument("--port", default=DEFAULT_PORT, type=int, help=f"HTTP port (default: {DEFAULT_PORT})")
     parser.add_argument("--api", default=DEFAULT_API, help=f"AutoDrive API state URL (default: {DEFAULT_API})")
@@ -1269,6 +2090,17 @@ def extract_linestring(geojson: object) -> list[list[float]]:
     raise ValueError("Expected a GeoJSON LineString")
 
 
+def _num(body: dict, key: str, default: float, lo: float, hi: float) -> float:
+    """Read a numeric field, clamped. The UI can send anything; the CAN bus cannot."""
+    value = body.get(key)
+    if value is None or value == "":
+        return default
+    n = float(value)
+    if not (lo <= n <= hi):
+        raise ValueError(f"{key} must be between {lo} and {hi} (got {n})")
+    return n
+
+
 def target_path(target: str, default_output: str) -> Path:
     filename = SAVE_TARGETS.get(target, default_output)
     path = (HERE / filename).resolve()
@@ -1323,13 +2155,44 @@ def make_handler(default_output: str, upstream_api: str, api_timeout_s: float):
                     self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                     return
                 self._send_json({"ok": True, "path": str(path_in), "geojson": geojson})
+            elif path == "/stream/state":
+                self._send_json(STREAM.snapshot())
+            elif path == "/stream/route":
+                self._send_json({"ok": True, "points": STREAM.route_points()})
+            elif path == "/stream/preview":
+                # The interpolated points that WILL be streamed — computed from the file,
+                # no CAN bus, no anchor. This is what Execute mode shows before you Play.
+                try:
+                    params = parse_qs(parsed.query)
+                    route = (params.get("route", ["line"])[0] or "line")
+                    if route not in routes.ROUTES:
+                        raise ValueError(f"unknown route {route!r}")
+                    spacing = float(params.get("spacing", [sp.DEFAULT_MAX_SPACING_M])[0])
+                    if not 0.05 <= spacing <= 10.0:
+                        raise ValueError("spacing must be 0.05..10 m")
+                    _, gate_route, dlat, dlon = sp.route_for_max_spacing(route, spacing)
+                    pts = [[*a.enu_to_wgs_approx(rp.x, rp.y, dlat, dlon), 1 if rp.is_headland else 0]
+                           for rp in gate_route]
+                except Exception as exc:                    # noqa: BLE001
+                    self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json({"ok": True, "points": pts,
+                                 "max_spacing": sp.max_route_spacing(gate_route)})
             elif path == "/health":
                 self._send_json({"ok": True})
             else:
                 self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
-            if urlparse(self.path).path != "/save":
+            path = urlparse(self.path).path
+            if path == "/stream/start":
+                self._stream_start()
+                return
+            if path == "/stream/stop":
+                STREAM.stop()
+                self._send_json({"ok": True})
+                return
+            if path != "/save":
                 self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                 return
             try:
@@ -1347,6 +2210,37 @@ def make_handler(default_output: str, upstream_api: str, api_timeout_s: float):
                 self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
             self._send_json({"ok": True, "path": str(path_out), "points": len(coords)})
+
+        def _stream_start(self) -> None:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 100_000:
+                    raise ValueError("Request body must be 1..100000 bytes")
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(body, dict):
+                    raise ValueError("Request body must be an object")
+
+                route = str(body.get("route") or "line")
+                if route not in routes.ROUTES:
+                    raise ValueError(f"unknown route {route!r}")
+
+                params = {
+                    "route": route,
+                    "max_spacing": _num(body, "max_spacing", sp.DEFAULT_MAX_SPACING_M, 0.05, 10.0),
+                    "window_size": int(_num(body, "window_size", sp.DEFAULT_WINDOW_SIZE, 1, 2000)),
+                    "trigger_fraction": _num(body, "trigger_fraction", sp.DEFAULT_TRIGGER_FRACTION, 0.01, 1.0),
+                    "overlap_offset": int(_num(body, "overlap_offset", sp.DEFAULT_OVERLAP_FROM_TRIGGER_OFFSET, 0, 500)),
+                    "nearest_ahead": int(_num(body, "nearest_ahead", sp.DEFAULT_NEAREST_AHEAD, 1, sp.MAX_PROGRESS_JUMP)),
+                    "nearest_backtrack": int(_num(body, "nearest_backtrack", sp.DEFAULT_NEAREST_BACKTRACK, 0, 100)),
+                    "timeout": _num(body, "timeout", 10.0, 1.0, 120.0),
+                    "no_inside_gate": bool(body.get("no_inside_gate")),
+                    "job_id": int(body["job_id"]) if body.get("job_id") else None,
+                }
+                STREAM.start(params)
+            except Exception as exc:                        # noqa: BLE001
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json({"ok": True, "state": STREAM.snapshot()})
 
         def _send_json(self, body: object, status: HTTPStatus = HTTPStatus.OK) -> None:
             self._send_bytes(
@@ -1375,9 +2269,11 @@ def make_handler(default_output: str, upstream_api: str, api_timeout_s: float):
 
 
 def main() -> None:
+    global STREAM
     args = parse_args()
     if args.api_timeout <= 0:
         raise SystemExit("--api-timeout must be greater than zero")
+    STREAM = StreamController(args.can_bus)
     server = ThreadingHTTPServer(
         (args.host, args.port),
         make_handler(args.output, args.api, args.api_timeout),
@@ -1391,6 +2287,11 @@ def main() -> None:
     print("", file=sys.stderr)
     print(f"  machine position from : {args.api}", file=sys.stderr)
     print(f"  saves to              : {', '.join(SAVE_TARGETS.values())}", file=sys.stderr)
+    print(f"  CAN bus (streaming)   : {args.can_bus}", file=sys.stderr)
+    if args.can_bus.startswith("vcan"):
+        print("                          (virtual bus — run ./simulator.py for a bench loop)", file=sys.stderr)
+    else:
+        print("                          *** REAL BUS — Play will transmit and AutoDrive will steer ***", file=sys.stderr)
     print("  Ctrl+C to stop", file=sys.stderr)
     print("", file=sys.stderr)
 
@@ -1399,6 +2300,11 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nstopping", file=sys.stderr)
     finally:
+        if STREAM is not None and STREAM.running():
+            print("standing down the streaming job...", file=sys.stderr)
+            STREAM.stop()
+            if STREAM.thread is not None:
+                STREAM.thread.join(timeout=5.0)
         server.server_close()
 
 
